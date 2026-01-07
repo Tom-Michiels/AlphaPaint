@@ -1,0 +1,7 @@
+# AlphaPaint Daemon - Python Dependencies
+
+# Serial communication
+pyserial>=3.5
+
+# YAML configuration
+PyYAML>=6.0

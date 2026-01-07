@@ -1,0 +1,39 @@
+# Binaries
+*.bin
+*.o
+*.elf
+*.exe
+*.out
+*.app
+
+# Build directories
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# ESP-IDF
+sdkconfig.old
+dependencies.lock
+
+# Temporary files
+*.tmp
+*.bak
+*.log

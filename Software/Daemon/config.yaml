@@ -1,0 +1,27 @@
+# AlphaPaint Daemon Configuration
+
+serial:
+  baud_rate: 115200
+  timeout: 1.0
+  reconnect_delay: 5.0
+
+machine:
+  pen_z_default: 0.5        # Default pen contact Z (mm) - height where pen touches paper
+  jog_feedrate: 1000        # Jog speed (mm/min)
+  draw_feedrate: 500        # Drawing speed (mm/min)
+  pen_lift_feedrate: 100    # Pen Z movement speed (mm/min)
+  # Note: Safe Z height is dynamically read from machine_limits['Z'][1]
+
+drawing:
+  ellipse_segments: 36      # Number of segments for ellipse approximation
+  min_position_delta: 0.01  # Minimum position change to send jog (mm)
+
+logging:
+  level: INFO               # DEBUG, INFO, WARNING, ERROR
+  file: /var/log/alphapaint-daemon.log
+  max_size: 10485760        # 10 MB
+  backup_count: 5
+
+debugging:
+  enable_console_echo: false  # Echo Console messages to log
+  enable_fluidnc_echo: false  # Echo FluidNC messages to log

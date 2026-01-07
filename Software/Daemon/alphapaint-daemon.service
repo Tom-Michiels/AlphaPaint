@@ -1,0 +1,25 @@
+[Unit]
+Description=AlphaPaint Daemon
+After=network.target
+Documentation=https://github.com/yourusername/alphapaint
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/alphapaint
+ExecStart=/usr/bin/python3 /home/pi/alphapaint/daemon.py /home/pi/alphapaint/config.yaml
+Restart=always
+RestartSec=5
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alphapaint-daemon
+
+[Install]
+WantedBy=multi-user.target
