@@ -1,6 +1,7 @@
 """State Machine for AlphaPaint Daemon."""
 
 import logging
+import threading
 import time
 from typing import Dict, Tuple, Optional
 from .console import ConsoleHandler
@@ -60,16 +61,20 @@ class StateMachine:
         self.active_axis = "X"
         self.precision_mode = False
 
-        # Register Console callbacks
+        # Register callbacks
         self._register_callbacks()
 
     def _register_callbacks(self):
-        """Register callbacks for Console messages."""
+        """Register callbacks for Console and FluidNC messages."""
+        # Console callbacks
         self.console.on_message('BTN', self._on_button)
         self.console.on_message('POS', self._on_position)
         self.console.on_message('AXIS', self._on_axis)
         self.console.on_message('PRECISION', self._on_precision)
         self.console.on_message('STATUS', self._on_status)
+
+        # FluidNC status callback for continuous position updates
+        self.fluidnc.on_status(self._on_fluidnc_status)
 
     def start(self):
         """Start the state machine."""
@@ -176,14 +181,17 @@ class StateMachine:
         if self.console_mode == "ACTIVE":
             self.fluidnc.cancel_jog()
 
+        # Stop FluidNC read thread before re-homing
+        self.fluidnc.stop()
+
         # Reset state
         self.homed = False
         self.point_B = None
         self.point_C = None
         self.pen_Z = self.config['machine']['pen_z_default']
 
-        # Go to NOT_HOMED
-        self.transition(self.STATE_NOT_HOMED)
+        # Start homing immediately
+        self._start_homing_sequence()
 
     def _start_homing_sequence(self):
         """Start homing sequence."""
@@ -222,6 +230,12 @@ class StateMachine:
             for axis in ['X', 'Y', 'Z']:
                 min_val, max_val = self.machine_limits[axis]
                 self.console.set_limit(axis, min_val, max_val)
+
+            # Enable automatic status reporting from FluidNC (100ms interval)
+            self.fluidnc.enable_auto_report(100)
+
+            # Start FluidNC read thread now that auto-reporting is enabled
+            self.fluidnc.start()
 
             # Enable ACTIVE mode
             self.console.set_mode('ACTIVE')
@@ -418,17 +432,22 @@ class StateMachine:
         except ValueError:
             self.logger.error(f"Invalid position value: {value_str}")
 
-    def _on_axis(self, axis: str, action: str):
+    def _on_axis(self, axis: str, action: str, *extra):
         """
         Handle axis selection from Console.
 
         Args:
             axis: Axis (X, Y, or Z)
-            action: SELECTED or other
+            action: SELECTED, or PRECISION (for precision mode toggle)
+            *extra: Additional arguments (e.g., ON/OFF for precision mode)
         """
         if action == "SELECTED":
             self.active_axis = axis
             self.logger.debug(f"Active axis: {axis}")
+        elif action == "PRECISION" and extra:
+            # Handle AXIS:X:PRECISION:ON/OFF format
+            self.precision_mode = (extra[0] == "ON")
+            self.logger.debug(f"Precision mode {axis}: {extra[0]}")
 
     def _on_precision(self, axis: str, state: str):
         """
@@ -451,6 +470,24 @@ class StateMachine:
         self.logger.debug(f"Console status: {status}")
 
     # ========== Helper Functions ==========
+
+    def _on_fluidnc_status(self, status: Dict):
+        """
+        Callback for FluidNC status updates (called automatically at 10Hz).
+
+        Args:
+            status: Status dict with 'state' and 'position' keys
+        """
+        if 'position' in status:
+            pos = status['position']
+            # Update internal position
+            self.current_pos = pos
+            # Only update console displays in PASSIVE mode
+            # In ACTIVE mode, the Console is the position master (encoder control)
+            if self.console_mode == 'PASSIVE':
+                self.console.set_position('X', pos['X'])
+                self.console.set_position('Y', pos['Y'])
+                self.console.set_position('Z', pos['Z'])
 
     def _error_blink_all(self):
         """Blink all LEDs to indicate error."""

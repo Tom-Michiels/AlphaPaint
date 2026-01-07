@@ -146,7 +146,7 @@ class ConsoleHandler:
         while self.running:
             try:
                 if self.serial and self.serial.is_open and self.serial.in_waiting:
-                    line = self.serial.readline().decode('utf-8').strip()
+                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
                     if line:
                         self.logger.debug(f"Console RX: {line}")
                         self._parse_message(line)
@@ -184,6 +184,7 @@ class ConsoleHandler:
                 self.callbacks[msg_type](*args)
             except Exception as e:
                 self.logger.error(f"Error in callback for {msg_type}: {e}")
+                self.logger.error(f"Message was: {message}")
         else:
             self.logger.debug(f"No callback registered for message type: {msg_type}")
 
@@ -201,14 +202,14 @@ class ConsoleHandler:
             # Clear input buffer
             self.serial.reset_input_buffer()
 
-            # Send ID query
+            # Send ID query (or any command to trigger a response)
             self.send("ID?")
 
             # Wait for response
             start_time = time.time()
             while time.time() - start_time < 2.0:
                 if self.serial.in_waiting:
-                    line = self.serial.readline().decode('utf-8').strip()
+                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
                     self.logger.debug(f"Console ID response: {line}")
 
                     # Check for Console identification string
@@ -217,6 +218,11 @@ class ConsoleHandler:
 
                     # Also accept STATUS message as confirmation
                     if line.startswith("STATUS:"):
+                        return True
+
+                    # Detect Console by its debug output pattern (ESP-IDF logging)
+                    # e.g. "I (12345) CONSOLE: RX: ..." or "CONSOLE: TX: ..."
+                    if "CONSOLE:" in line and ("RX:" in line or "TX:" in line):
                         return True
 
                 time.sleep(0.1)

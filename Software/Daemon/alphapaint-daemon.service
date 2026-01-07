@@ -8,7 +8,7 @@ Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/alphapaint
-ExecStart=/usr/bin/python3 /home/pi/alphapaint/daemon.py /home/pi/alphapaint/config.yaml
+ExecStart=/home/pi/alphapaint/venv/bin/python /home/pi/alphapaint/daemon.py /home/pi/alphapaint/config.yaml
 Restart=always
 RestartSec=5
 

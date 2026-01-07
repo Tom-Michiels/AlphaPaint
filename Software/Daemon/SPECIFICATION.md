@@ -281,9 +281,8 @@ class DaemonState:
 **Re-homing (Any State):**
 - User long-presses button A (≥500ms)
 - Console sends `BTN:A:LONG`
-- Daemon resets all state variables
-- Returns to `NOT_HOMED` state
-- Repeat homing sequence
+- Daemon resets all state variables (canvas points, pen Z)
+- Immediately starts homing sequence (no additional button press required)
 
 **Implementation:**
 ```python
@@ -293,14 +292,17 @@ def on_button_A_short():
 
 def on_button_A_long():
     # Re-home from any state
-    reset_state()
-    state = "NOT_HOMED"
-    set_led('A', 'BLINK')  # A slow blink
-    set_led('B', 'OFF')
-    set_led('C', 'OFF')
-    set_led('D', 'OFF')
-    set_led('E', 'OFF')
-    set_led('F', 'OFF')
+    # Cancel any active jog
+    if console_mode == "ACTIVE":
+        cancel_jog()
+
+    # Reset state variables
+    point_B = None
+    point_C = None
+    pen_Z = config['pen_z_default']
+
+    # Immediately start homing
+    start_homing_sequence()
 
 def start_homing_sequence():
     state = "HOMING"
@@ -857,10 +859,9 @@ def on_button_A_long():
     if console_mode == "ACTIVE":
         cancel_jog()
 
-    # Reset state and return to NOT_HOMED
+    # Reset state variables and immediately start homing
     reset_state()
-    state = "NOT_HOMED"
-    # ... (rest of re-homing logic)
+    start_homing_sequence()
 ```
 
 ### 5.3 Passive Mode Display Updates
@@ -1014,8 +1015,7 @@ When sending multi-line G-code (e.g., drawing operations):
 
 **From ERROR State:**
 - User long-presses button A
-- Daemon resets to `NOT_HOMED`
-- User must re-home
+- Daemon resets state and immediately starts homing sequence
 
 **Connection Loss:**
 - Daemon continuously attempts reconnection

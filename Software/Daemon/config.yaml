@@ -7,9 +7,9 @@ serial:
 
 machine:
   pen_z_default: 0.5        # Default pen contact Z (mm) - height where pen touches paper
-  jog_feedrate: 1000        # Jog speed (mm/min)
-  draw_feedrate: 500        # Drawing speed (mm/min)
-  pen_lift_feedrate: 100    # Pen Z movement speed (mm/min)
+  jog_feedrate: 10000       # Jog speed (mm/min)
+  draw_feedrate: 3000       # Drawing speed (mm/min)
+  pen_lift_feedrate: 10000  # Pen Z movement speed (mm/min)
   # Note: Safe Z height is dynamically read from machine_limits['Z'][1]
 
 drawing:

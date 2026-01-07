@@ -18,31 +18,35 @@ if [ "$EUID" -eq 0 ]; then
     exit 1
 fi
 
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 # Installation directory
 INSTALL_DIR="/home/$USER/alphapaint"
 
+echo "Installing from: $SCRIPT_DIR"
 echo "Installing to: $INSTALL_DIR"
 echo ""
 
 # Create installation directory
 echo "[1/6] Creating installation directory..."
 mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
 
 # Copy files
 echo "[2/6] Copying daemon files..."
-cp -r lib "$INSTALL_DIR/"
-cp daemon.py "$INSTALL_DIR/"
-cp config.yaml "$INSTALL_DIR/"
-cp requirements.txt "$INSTALL_DIR/"
-cp alphapaint-daemon.service "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/daemon.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/config.yaml" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/alphapaint-daemon.service" "$INSTALL_DIR/"
 
 # Make daemon executable
 chmod +x "$INSTALL_DIR/daemon.py"
 
-# Install Python dependencies
-echo "[3/6] Installing Python dependencies..."
-pip3 install -r requirements.txt
+# Create virtual environment and install Python dependencies
+echo "[3/6] Creating virtual environment and installing dependencies..."
+python3 -m venv "$INSTALL_DIR/venv"
+"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 # Add user to dialout group for serial port access
 echo "[4/6] Setting up serial port permissions..."
@@ -62,7 +66,7 @@ sudo chown $USER:$USER /var/log/alphapaint-daemon.log
 echo "[6/6] Installing systemd service..."
 
 # Update service file with actual user and paths
-sudo cp alphapaint-daemon.service /etc/systemd/system/
+sudo cp "$INSTALL_DIR/alphapaint-daemon.service" /etc/systemd/system/
 sudo sed -i "s|User=pi|User=$USER|g" /etc/systemd/system/alphapaint-daemon.service
 sudo sed -i "s|Group=pi|Group=$USER|g" /etc/systemd/system/alphapaint-daemon.service
 sudo sed -i "s|/home/pi/alphapaint|$INSTALL_DIR|g" /etc/systemd/system/alphapaint-daemon.service

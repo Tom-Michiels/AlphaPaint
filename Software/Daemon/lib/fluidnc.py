@@ -5,7 +5,8 @@ import threading
 import logging
 import time
 import re
-from typing import Optional, Dict, Tuple
+import queue
+from typing import Optional, Dict, Tuple, Callable
 
 
 class FluidNCHandler:
@@ -25,8 +26,13 @@ class FluidNCHandler:
         self.timeout = timeout
         self.serial: Optional[serial.Serial] = None
         self.logger = logging.getLogger(__name__)
-        self.response_queue = []
-        self.response_lock = threading.Lock()
+        self._serial_lock = threading.Lock()  # Protects all serial operations
+
+        # Background read thread
+        self._read_thread: Optional[threading.Thread] = None
+        self._running = False
+        self._response_queue: queue.Queue = queue.Queue()
+        self._status_callback: Optional[Callable[[Dict], None]] = None
 
     def connect(self) -> bool:
         """
@@ -50,13 +56,91 @@ class FluidNCHandler:
 
     def disconnect(self):
         """Disconnect from FluidNC."""
+        self.stop()
         if self.serial and self.serial.is_open:
             self.serial.close()
             self.logger.info("Disconnected from FluidNC")
 
-    def send(self, command: str) -> bool:
+    def start(self):
+        """Start background read thread for continuous status updates."""
+        if self._running:
+            return
+
+        self._running = True
+        self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._read_thread.start()
+        self.logger.info("FluidNC read thread started")
+
+    def stop(self):
+        """Stop background read thread."""
+        if not self._running:
+            return
+
+        self._running = False
+        if self._read_thread:
+            self._read_thread.join(timeout=2.0)
+            self._read_thread = None
+        self.logger.info("FluidNC read thread stopped")
+
+    def on_status(self, callback: Callable[[Dict], None]):
         """
-        Send raw command to FluidNC (without waiting for response).
+        Register callback for status updates.
+
+        Args:
+            callback: Function receiving status dict with 'state' and 'position' keys
+        """
+        self._status_callback = callback
+
+    def enable_auto_report(self, interval_ms: int = 100) -> bool:
+        """
+        Enable automatic status reporting from FluidNC.
+
+        Args:
+            interval_ms: Report interval in milliseconds
+
+        Returns:
+            True if command sent successfully
+        """
+        return self.send(f"$Report/Interval={interval_ms}")
+
+    def _read_loop(self):
+        """Background thread that reads from FluidNC and dispatches messages."""
+        while self._running:
+            try:
+                if self.serial and self.serial.is_open and self.serial.in_waiting:
+                    line = self.serial.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        self.logger.debug(f"FluidNC RX: {line}")
+                        self._dispatch_message(line)
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                self.logger.error(f"Error in FluidNC read loop: {e}")
+                time.sleep(0.1)
+
+    def _dispatch_message(self, line: str):
+        """
+        Dispatch incoming message to appropriate handler.
+
+        Args:
+            line: Raw line from FluidNC
+        """
+        if line.startswith('<'):
+            # Status report - call callback
+            status = self._parse_status(line)
+            if status and self._status_callback:
+                try:
+                    self._status_callback(status)
+                except Exception as e:
+                    self.logger.error(f"Error in status callback: {e}")
+        elif line.startswith('ok') or line.startswith('error:'):
+            # Command response - put in queue for waiting commands
+            self._response_queue.put(line)
+        # Other messages (info, welcome, etc.) are just logged
+
+    def _send_unlocked(self, command: str) -> bool:
+        """
+        Send raw command to FluidNC (internal, no lock).
 
         Args:
             command: Command string (will add newline if not present)
@@ -79,9 +163,24 @@ class FluidNCHandler:
             self.logger.error(f"Failed to send to FluidNC: {e}")
             return False
 
+    def send(self, command: str) -> bool:
+        """
+        Send raw command to FluidNC (without waiting for response).
+        Thread-safe.
+
+        Args:
+            command: Command string (will add newline if not present)
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        with self._serial_lock:
+            return self._send_unlocked(command)
+
     def send_gcode(self, gcode: str, wait_ok: bool = True, timeout: float = 10.0) -> bool:
         """
         Send G-code command and optionally wait for 'ok' response.
+        Thread-safe: acquires serial lock for sending.
 
         Args:
             gcode: G-code command
@@ -91,33 +190,59 @@ class FluidNCHandler:
         Returns:
             True if successful, False on error
         """
-        if not self.send(gcode):
-            return False
+        # Clear any stale responses from the queue
+        if self._running:
+            while not self._response_queue.empty():
+                try:
+                    self._response_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        with self._serial_lock:
+            if not self._send_unlocked(gcode):
+                return False
 
         if not wait_ok:
             return True
 
         # Wait for 'ok' or 'error' response
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            response = self.readline()
-            if response:
-                self.logger.debug(f"FluidNC RX: {response}")
-
+        if self._running:
+            # Background thread is handling reads - use queue
+            try:
+                response = self._response_queue.get(timeout=timeout)
                 if response.startswith('ok'):
                     return True
                 elif response.startswith('error:'):
                     self.logger.error(f"FluidNC error: {response}")
                     return False
+            except queue.Empty:
+                self.logger.error(f"Timeout waiting for response to: {gcode}")
+                return False
+        else:
+            # No background thread - read directly
+            with self._serial_lock:
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    response = self._readline_unlocked()
+                    if response:
+                        self.logger.debug(f"FluidNC RX: {response}")
 
-            time.sleep(0.01)
+                        if response.startswith('ok'):
+                            return True
+                        elif response.startswith('error:'):
+                            self.logger.error(f"FluidNC error: {response}")
+                            return False
 
-        self.logger.error(f"Timeout waiting for response to: {gcode}")
+                    time.sleep(0.01)
+
+                self.logger.error(f"Timeout waiting for response to: {gcode}")
+                return False
+
         return False
 
-    def readline(self, timeout: Optional[float] = None) -> Optional[str]:
+    def _readline_unlocked(self, timeout: Optional[float] = None) -> Optional[str]:
         """
-        Read a line from FluidNC.
+        Read a line from FluidNC (internal, no lock).
 
         Args:
             timeout: Override default timeout
@@ -144,6 +269,20 @@ class FluidNCHandler:
 
         return None
 
+    def readline(self, timeout: Optional[float] = None) -> Optional[str]:
+        """
+        Read a line from FluidNC.
+        Thread-safe.
+
+        Args:
+            timeout: Override default timeout
+
+        Returns:
+            Line string (stripped) or None if nothing available
+        """
+        with self._serial_lock:
+            return self._readline_unlocked(timeout)
+
     def home(self) -> bool:
         """
         Execute homing sequence.
@@ -157,6 +296,7 @@ class FluidNCHandler:
     def get_limits(self) -> Dict[str, Tuple[float, float]]:
         """
         Query machine limits from FluidNC settings.
+        Thread-safe: acquires serial lock for entire operation.
 
         Returns:
             Dictionary with axis limits: {'X': (min, max), ...}
@@ -168,25 +308,29 @@ class FluidNCHandler:
             'Z': (0.0, 50.0)
         }
 
-        # Send $$ to get settings
-        if not self.send("$$"):
-            return limits
+        with self._serial_lock:
+            # Send $$ to get settings
+            if not self._send_unlocked("$$"):
+                return limits
 
-        # Read settings for ~2 seconds
-        start_time = time.time()
-        settings = {}
+            # Read settings until 'ok' or timeout
+            start_time = time.time()
+            settings = {}
 
-        while time.time() - start_time < 2.0:
-            line = self.readline(timeout=0.1)
-            if line:
-                # Parse setting line: $130=300.000
-                match = re.match(r'\$(\d+)=([\d.-]+)', line)
-                if match:
-                    setting_num = int(match.group(1))
-                    value = float(match.group(2))
-                    settings[setting_num] = value
+            while time.time() - start_time < 2.0:
+                line = self._readline_unlocked(timeout=0.1)
+                if line:
+                    # Check for end of settings
+                    if line.startswith('ok'):
+                        break
+                    # Parse setting line: $130=300.000
+                    match = re.match(r'\$(\d+)=([\d.-]+)', line)
+                    if match:
+                        setting_num = int(match.group(1))
+                        value = float(match.group(2))
+                        settings[setting_num] = value
 
-        # Extract limits from settings
+        # Extract limits from settings (outside lock - just local data)
         # $130, $131, $132 = max travel for X, Y, Z
         if 130 in settings:
             limits['X'] = (0.0, settings[130])
@@ -201,21 +345,23 @@ class FluidNCHandler:
     def get_status(self) -> Optional[Dict]:
         """
         Query current status and position.
+        Thread-safe: acquires serial lock for entire operation.
 
         Returns:
             Dictionary with state and position, or None on error
         """
-        if not self.send("?"):
+        with self._serial_lock:
+            if not self._send_unlocked("?"):
+                return None
+
+            # Wait for status response: <Idle|MPos:10.00,20.00,5.00|...>
+            start_time = time.time()
+            while time.time() - start_time < 0.2:  # 200ms is plenty for status response
+                line = self._readline_unlocked(timeout=0.1)
+                if line and line.startswith('<'):
+                    return self._parse_status(line)
+
             return None
-
-        # Wait for status response: <Idle|MPos:10.00,20.00,5.00|...>
-        start_time = time.time()
-        while time.time() - start_time < 1.0:
-            line = self.readline(timeout=0.1)
-            if line and line.startswith('<'):
-                return self._parse_status(line)
-
-        return None
 
     def _parse_status(self, status_line: str) -> Optional[Dict]:
         """
@@ -271,42 +417,47 @@ class FluidNCHandler:
     def cancel_jog(self) -> bool:
         """
         Cancel any active jog command.
+        Thread-safe.
 
         Returns:
             True if cancel sent successfully
         """
-        # Send Jog Cancel character (0x85)
-        try:
-            if self.serial and self.serial.is_open:
-                self.serial.write(b'\x85')
-                self.logger.info("Jog cancelled")
-                return True
-        except Exception as e:
-            self.logger.error(f"Error cancelling jog: {e}")
+        with self._serial_lock:
+            # Send Jog Cancel character (0x85)
+            try:
+                if self.serial and self.serial.is_open:
+                    self.serial.write(b'\x85')
+                    self.logger.info("Jog cancelled")
+                    return True
+            except Exception as e:
+                self.logger.error(f"Error cancelling jog: {e}")
 
-        return False
+            return False
 
     def soft_reset(self) -> bool:
         """
         Send soft reset (Ctrl-X).
+        Thread-safe.
 
         Returns:
             True if reset sent successfully
         """
-        try:
-            if self.serial and self.serial.is_open:
-                self.serial.write(b'\x18')
-                self.logger.info("Soft reset sent")
-                time.sleep(2.0)  # Wait for reset
-                return True
-        except Exception as e:
-            self.logger.error(f"Error sending soft reset: {e}")
+        with self._serial_lock:
+            try:
+                if self.serial and self.serial.is_open:
+                    self.serial.write(b'\x18')
+                    self.logger.info("Soft reset sent")
+                    time.sleep(2.0)  # Wait for reset
+                    return True
+            except Exception as e:
+                self.logger.error(f"Error sending soft reset: {e}")
 
-        return False
+            return False
 
     def identify(self) -> bool:
         """
         Identify if this device is a FluidNC controller.
+        Thread-safe.
 
         Returns:
             True if device is FluidNC, False otherwise
@@ -314,39 +465,40 @@ class FluidNCHandler:
         if not self.serial or not self.serial.is_open:
             return False
 
-        try:
-            # Clear input buffer
-            self.serial.reset_input_buffer()
+        with self._serial_lock:
+            try:
+                # Clear input buffer
+                self.serial.reset_input_buffer()
 
-            # Send version query
-            self.send("$I")
+                # Send version query
+                self._send_unlocked("$I")
 
-            # Wait for response
-            start_time = time.time()
-            while time.time() - start_time < 2.0:
-                line = self.readline(timeout=0.1)
-                if line:
-                    self.logger.debug(f"FluidNC ID response: {line}")
+                # Wait for response
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    line = self._readline_unlocked(timeout=0.1)
+                    if line:
+                        self.logger.debug(f"FluidNC ID response: {line}")
 
-                    # Look for FluidNC/Grbl version string
-                    if '[VER:' in line or '[MSG:' in line or 'Grbl' in line:
+                        # Look for FluidNC/Grbl version string
+                        if '[VER:' in line or '[MSG:' in line or 'Grbl' in line:
+                            return True
+
+                        # Also check for status response
+                        if line.startswith('<'):
+                            return True
+
+                # Try status query as alternative
+                self._send_unlocked("?")
+                time.sleep(0.5)
+
+                while self.serial.in_waiting:
+                    line = self._readline_unlocked(timeout=0.1)
+                    if line and line.startswith('<'):
                         return True
 
-                    # Also check for status response
-                    if line.startswith('<'):
-                        return True
+                return False
 
-            # Try status query as alternative
-            self.send("?")
-            time.sleep(0.5)
-
-            while self.serial.in_waiting:
-                line = self.readline(timeout=0.1)
-                if line and line.startswith('<'):
-                    return True
-
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Error identifying FluidNC: {e}")
+            except Exception as e:
+                self.logger.error(f"Error identifying FluidNC: {e}")
             return False
