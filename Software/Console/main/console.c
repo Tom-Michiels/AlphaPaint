@@ -22,6 +22,7 @@
 #include "driver/pcnt.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "rom/ets_sys.h"  // For ets_delay_us
 
 static const char *TAG = "CONSOLE";
 
@@ -82,7 +83,7 @@ static const char *TAG = "CONSOLE";
 #define LED_BLINK_MS              500  // Slow blink for BLINK mode (was 300ms)
 #define NOT_HOMED_BLINK_MS        300
 #define POSITION_UPDATE_RATE_MS   50   // Rate limit for UART position updates
-#define MAIN_LOOP_DELAY_MS        50
+#define MAIN_LOOP_DELAY_MS        1    // Minimal delay - just yield to RTOS scheduler
 #define ENCODER_COUNTS_PER_CLICK  4
 #define NORMAL_INCREMENT          100
 #define PRECISION_INCREMENT       1
@@ -732,15 +733,14 @@ void process_uart_command(const char *cmd) {
     }
 }
 
-// Check for incoming UART data
+// Check for incoming UART data - process all available bytes
 void check_uart_rx(void) {
     static char rx_buffer[128];
     static int rx_pos = 0;
 
     uint8_t data;
-    int len = uart_read_bytes(UART_NUM, &data, 1, 0);
-
-    if (len > 0) {
+    // Read all available bytes in the UART buffer
+    while (uart_read_bytes(UART_NUM, &data, 1, 0) > 0) {
         if (data == '\n' || data == '\r') {
             if (rx_pos > 0) {
                 rx_buffer[rx_pos] = '\0';
