@@ -34,6 +34,14 @@ class FluidNCHandler:
         self._response_queue: queue.Queue = queue.Queue()
         self._status_callback: Optional[Callable[[Dict], None]] = None
 
+        # Buffer management for flow control (character-counting protocol)
+        self._buffer_size = 128  # FluidNC/Grbl RX buffer size
+        self._buffer_used = 0  # Bytes currently in buffer
+        self._pending_commands: list = []  # Track sent command lengths
+        self._buffer_lock = threading.Lock()
+        self._buffer_space_event = threading.Event()
+        self._buffer_space_event.set()  # Initially have space
+
     def connect(self) -> bool:
         """
         Connect to FluidNC serial port.
@@ -65,6 +73,19 @@ class FluidNCHandler:
         """Start background read thread for continuous status updates."""
         if self._running:
             return
+
+        # Reset buffer tracking
+        with self._buffer_lock:
+            self._buffer_used = 0
+            self._pending_commands.clear()
+            self._buffer_space_event.set()
+
+        # Clear response queue
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except queue.Empty:
+                break
 
         self._running = True
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -134,9 +155,24 @@ class FluidNCHandler:
                 except Exception as e:
                     self.logger.error(f"Error in status callback: {e}")
         elif line.startswith('ok') or line.startswith('error:'):
+            # Command acknowledged - free buffer space
+            self._on_command_ack()
             # Command response - put in queue for waiting commands
             self._response_queue.put(line)
         # Other messages (info, welcome, etc.) are just logged
+
+    def _on_command_ack(self):
+        """Called when FluidNC acknowledges a command (ok or error)."""
+        with self._buffer_lock:
+            if self._pending_commands:
+                cmd_len = self._pending_commands.pop(0)
+                self._buffer_used -= cmd_len
+                if self._buffer_used < 0:
+                    self._buffer_used = 0  # Safety
+                self.logger.debug(f"Buffer freed {cmd_len} bytes, now {self._buffer_used}/{self._buffer_size}")
+            # Signal that there's buffer space available
+            if self._buffer_used < self._buffer_size - 50:  # Leave some margin
+                self._buffer_space_event.set()
 
     def _send_unlocked(self, command: str) -> bool:
         """
@@ -179,27 +215,52 @@ class FluidNCHandler:
 
     def send_gcode(self, gcode: str, wait_ok: bool = True, timeout: float = 10.0) -> bool:
         """
-        Send G-code command and optionally wait for 'ok' response.
-        Thread-safe: acquires serial lock for sending.
+        Send G-code command with proper flow control.
+        Thread-safe: uses buffer management to prevent overflow.
 
         Args:
             gcode: G-code command
-            wait_ok: Wait for 'ok' response
+            wait_ok: Wait for 'ok' response before returning
             timeout: Timeout in seconds for waiting
 
         Returns:
             True if successful, False on error
         """
-        # Clear any stale responses from the queue
-        if self._running:
-            while not self._response_queue.empty():
-                try:
-                    self._response_queue.get_nowait()
-                except queue.Empty:
-                    break
+        # Calculate command length (including newline)
+        cmd_with_newline = gcode if gcode.endswith('\n') else gcode + '\n'
+        cmd_len = len(cmd_with_newline)
 
+        # Wait for buffer space if needed (flow control)
+        if self._running:
+            start_time = time.time()
+            while True:
+                with self._buffer_lock:
+                    if self._buffer_used + cmd_len <= self._buffer_size:
+                        # Have space - track this command
+                        self._buffer_used += cmd_len
+                        self._pending_commands.append(cmd_len)
+                        self.logger.debug(f"Buffer: +{cmd_len} bytes, now {self._buffer_used}/{self._buffer_size}")
+                        if self._buffer_used >= self._buffer_size - 50:
+                            self._buffer_space_event.clear()
+                        break
+
+                # No space - wait for acknowledgment
+                if time.time() - start_time > timeout:
+                    self.logger.error(f"Timeout waiting for buffer space to send: {gcode}")
+                    return False
+
+                # Wait for buffer space event with short timeout
+                self._buffer_space_event.wait(timeout=0.1)
+
+        # Send the command
         with self._serial_lock:
             if not self._send_unlocked(gcode):
+                # Failed to send - remove from tracking
+                if self._running:
+                    with self._buffer_lock:
+                        if self._pending_commands and self._pending_commands[-1] == cmd_len:
+                            self._pending_commands.pop()
+                            self._buffer_used -= cmd_len
                 return False
 
         if not wait_ok:
@@ -219,7 +280,7 @@ class FluidNCHandler:
                 self.logger.error(f"Timeout waiting for response to: {gcode}")
                 return False
         else:
-            # No background thread - read directly
+            # No background thread - read directly (no flow control)
             with self._serial_lock:
                 start_time = time.time()
                 while time.time() - start_time < timeout:
@@ -448,6 +509,13 @@ class FluidNCHandler:
                     self.serial.write(b'\x18')
                     self.logger.info("Soft reset sent")
                     time.sleep(2.0)  # Wait for reset
+
+                    # Reset buffer tracking after reset
+                    with self._buffer_lock:
+                        self._buffer_used = 0
+                        self._pending_commands.clear()
+                        self._buffer_space_event.set()
+
                     return True
             except Exception as e:
                 self.logger.error(f"Error sending soft reset: {e}")
@@ -502,3 +570,25 @@ class FluidNCHandler:
             except Exception as e:
                 self.logger.error(f"Error identifying FluidNC: {e}")
             return False
+
+    def wait_idle(self, timeout: float = 60.0, poll_interval: float = 0.1) -> bool:
+        """
+        Wait until FluidNC is in Idle state (all motion complete).
+
+        Args:
+            timeout: Maximum time to wait in seconds
+            poll_interval: Time between status checks in seconds
+
+        Returns:
+            True if Idle state reached, False on timeout
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            status = self.get_status()
+            if status and status.get('state') == 'Idle':
+                return True
+            time.sleep(poll_interval)
+
+        self.logger.warning(f"Timeout waiting for Idle state after {timeout}s")
+        return False

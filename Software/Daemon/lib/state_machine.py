@@ -6,7 +6,7 @@ import time
 from typing import Dict, Tuple, Optional
 from .console import ConsoleHandler
 from .fluidnc import FluidNCHandler
-from .drawing import draw_line, draw_ellipse
+from .external_program import ExternalProgramHandler
 
 
 class StateMachine:
@@ -20,6 +20,7 @@ class StateMachine:
     STATE_CANVAS_SETUP = "CANVAS_SETUP"
     STATE_READY = "READY"
     STATE_DRAWING = "DRAWING"
+    STATE_EXTERNAL_PROGRAM = "EXTERNAL_PROGRAM"
     STATE_ERROR = "ERROR"
 
     def __init__(
@@ -61,6 +62,10 @@ class StateMachine:
         self.active_axis = "X"
         self.precision_mode = False
 
+        # External program handler
+        self.external_handler: Optional[ExternalProgramHandler] = None
+        self.active_external_button: Optional[str] = None
+
         # Register callbacks
         self._register_callbacks()
 
@@ -80,6 +85,26 @@ class StateMachine:
         """Start the state machine."""
         self.logger.info("State machine starting")
         self.transition(self.STATE_NOT_HOMED)
+
+    def stop(self):
+        """Stop the state machine and clean up resources."""
+        self.logger.info("State machine stopping")
+
+        # Stop any external program
+        if self.external_handler:
+            try:
+                self.external_handler.interrupt()
+            except Exception as e:
+                self.logger.debug(f"Error stopping external program: {e}")
+            self.external_handler = None
+            self.active_external_button = None
+
+        # Stop FluidNC background thread
+        if self.fluidnc:
+            try:
+                self.fluidnc.stop()
+            except Exception as e:
+                self.logger.debug(f"Error stopping FluidNC: {e}")
 
     def transition(self, new_state: str):
         """
@@ -126,8 +151,36 @@ class StateMachine:
         self.console.set_led('B', 'ON')
         self.console.set_led('C', 'ON')
         self.console.set_led('D', 'ON')
-        self.console.set_led('E', 'BLINK')  # Slow blink - drawing available
-        self.console.set_led('F', 'BLINK')  # Slow blink - drawing available
+
+        # Set LEDs for external programs (E, F, G) based on config
+        for button, config_key in [('E', 'button_e'), ('F', 'button_f'), ('G', 'button_g')]:
+            if self._is_external_program_available(config_key):
+                self.console.set_led(button, 'BLINK')  # Slow blink - program available
+            else:
+                self.console.set_led(button, 'OFF')
+
+    def _is_external_program_available(self, config_key: str) -> bool:
+        """
+        Check if an external program is configured and available.
+
+        Args:
+            config_key: Config key like 'button_e', 'button_f', 'button_g'
+
+        Returns:
+            True if program is enabled and command exists
+        """
+        ext_programs = self.config.get('external_programs')
+        if not ext_programs:
+            return False
+
+        ext_config = ext_programs.get(config_key)
+        if not ext_config:
+            return False
+
+        enabled = ext_config.get('enabled', False)
+        command = ext_config.get('command', '')
+
+        return enabled and command
 
     # ========== Button Handlers ==========
 
@@ -160,13 +213,17 @@ class StateMachine:
         elif button == 'D' and action == 'SHORT':
             self._on_button_D()
 
-        # Button E - Draw line
+        # Button E - External program 1 or draw line
         elif button == 'E' and action == 'SHORT':
             self._on_button_E()
 
-        # Button F - Draw ellipse
+        # Button F - External program 2 or draw ellipse
         elif button == 'F' and action == 'SHORT':
             self._on_button_F()
+
+        # Button G - External program 3
+        elif button == 'G' and action == 'SHORT':
+            self._on_button_G()
 
     def _on_button_A_short(self):
         """Handle button A short press - start homing."""
@@ -177,9 +234,20 @@ class StateMachine:
         """Handle button A long press - re-home from any state."""
         self.logger.info("Re-homing requested")
 
+        # If external program is running, interrupt it first
+        if self.state == self.STATE_EXTERNAL_PROGRAM and self.external_handler:
+            self.logger.info("Interrupting external program for re-homing")
+            self.external_handler.interrupt()
+            self.external_handler = None
+            self.active_external_button = None
+
         # Cancel any active jog
         if self.console_mode == "ACTIVE":
             self.fluidnc.cancel_jog()
+
+        # Lift pen for safety before re-homing
+        max_z = self.machine_limits['Z'][1]
+        self.fluidnc.send_gcode(f"G0 Z{max_z:.2f}", wait_ok=True, timeout=5.0)
 
         # Stop FluidNC read thread before re-homing
         self.fluidnc.stop()
@@ -200,7 +268,6 @@ class StateMachine:
         self.console.set_led('A', 'FAST_BLINK')
 
         # Execute homing in background thread to avoid blocking
-        import threading
         threading.Thread(target=self._execute_homing, daemon=True).start()
 
     def _execute_homing(self):
@@ -310,99 +377,168 @@ class StateMachine:
                 self.logger.info(f"Canvas defined: B={self.point_B}, C={self.point_C}")
 
     def _on_button_E(self):
-        """Handle button E - draw line."""
+        """Handle button E - external program 1."""
         if self.state != self.STATE_READY:
             return
 
         if self.point_B is None or self.point_C is None:
-            self.logger.warning("Cannot draw line: canvas not defined")
+            self.logger.warning("Cannot run program: canvas not defined")
             self._error_blink_all()
             return
 
-        self.logger.info("Drawing line")
-        self.transition(self.STATE_DRAWING)
-        self.console.set_led('E', 'FAST_BLINK')
-        self.console.set_mode('PASSIVE')
-        self.console_mode = 'PASSIVE'
-
-        # Execute drawing in background thread
-        import threading
-        threading.Thread(target=self._execute_line_drawing, daemon=True).start()
-
-    def _execute_line_drawing(self):
-        """Execute line drawing (runs in background thread)."""
-        try:
-            success = draw_line(
-                self.fluidnc,
-                self.point_B,
-                self.point_C,
-                self.pen_Z,
-                self.machine_limits,
-                draw_feedrate=self.config['machine']['draw_feedrate'],
-                pen_feedrate=self.config['machine']['pen_lift_feedrate']
-            )
-
-            if success:
-                self.logger.info("Line drawing complete")
-                self.transition(self.STATE_READY)
-                self.console.set_mode('ACTIVE')
-                self.console_mode = 'ACTIVE'
-            else:
-                self.logger.error("Line drawing failed")
-                self.transition(self.STATE_ERROR)
-                self._error_blink_all()
-
-        except Exception as e:
-            self.logger.error(f"Error during line drawing: {e}")
-            self.transition(self.STATE_ERROR)
-            self._error_blink_all()
+        self._try_start_external_program('E', 'button_e')
 
     def _on_button_F(self):
-        """Handle button F - draw ellipse."""
+        """Handle button F - external program 2."""
         if self.state != self.STATE_READY:
             return
 
         if self.point_B is None or self.point_C is None:
-            self.logger.warning("Cannot draw ellipse: canvas not defined")
+            self.logger.warning("Cannot run program: canvas not defined")
             self._error_blink_all()
             return
 
-        self.logger.info("Drawing ellipse")
-        self.transition(self.STATE_DRAWING)
-        self.console.set_led('F', 'FAST_BLINK')
+        self._try_start_external_program('F', 'button_f')
+
+    def _on_button_G(self):
+        """Handle button G - external program 3."""
+        if self.state != self.STATE_READY:
+            return
+
+        if self.point_B is None or self.point_C is None:
+            self.logger.warning("Cannot run program: canvas not defined")
+            self._error_blink_all()
+            return
+
+        self._try_start_external_program('G', 'button_g')
+
+    def _try_start_external_program(self, button: str, config_key: str):
+        """
+        Try to start an external program for the given button.
+        Logs extensive debug info if program is not configured.
+        """
+        # Log all config info for debugging
+        self.logger.info(f"Button {button} pressed - checking external program config")
+        self.logger.info(f"Config keys present: {list(self.config.keys())}")
+
+        ext_programs = self.config.get('external_programs')
+        if ext_programs is None:
+            self.logger.error(f"Button {button}: 'external_programs' section MISSING from config!")
+            self.logger.error(f"Full config: {self.config}")
+            self._error_blink_all()
+            return
+
+        self.logger.info(f"external_programs keys: {list(ext_programs.keys())}")
+
+        ext_config = ext_programs.get(config_key)
+        if ext_config is None:
+            self.logger.error(f"Button {button}: '{config_key}' section MISSING from external_programs!")
+            self.logger.error(f"external_programs content: {ext_programs}")
+            self._error_blink_all()
+            return
+
+        self.logger.info(f"{config_key} config: {ext_config}")
+
+        enabled = ext_config.get('enabled', False)
+        command = ext_config.get('command', '')
+
+        self.logger.info(f"enabled={enabled} (type={type(enabled).__name__})")
+        self.logger.info(f"command='{command}' (type={type(command).__name__})")
+
+        if not enabled:
+            self.logger.error(f"Button {button}: external program is DISABLED (enabled={enabled})")
+            self._error_blink_all()
+            return
+
+        if not command:
+            self.logger.error(f"Button {button}: external program has NO COMMAND (command='{command}')")
+            self._error_blink_all()
+            return
+
+        # All checks passed - start the program
+        self._start_external_program(button, ext_config)
+
+    # ========== External Program Handling ==========
+
+    def _start_external_program(self, button: str, ext_config: Dict):
+        """
+        Start an external drawing program.
+
+        Args:
+            button: Button identifier (E, F, or G)
+            ext_config: External program configuration dict
+        """
+        command = ext_config.get('command', '')
+        args = ext_config.get('args', [])
+        timeout = ext_config.get('timeout', 0)
+        name = ext_config.get('name', f'Program {button}')
+
+        self.logger.info(f"Starting external program '{name}': {command}")
+
+        # Calculate canvas origin and size from points B and C
+        min_x = min(self.point_B[0], self.point_C[0])
+        min_y = min(self.point_B[1], self.point_C[1])
+        max_x = max(self.point_B[0], self.point_C[0])
+        max_y = max(self.point_B[1], self.point_C[1])
+
+        canvas_origin = (min_x, min_y)
+        canvas_size = (max_x - min_x, max_y - min_y)
+
+        # Create handler
+        self.external_handler = ExternalProgramHandler(
+            fluidnc=self.fluidnc,
+            config=self.config,
+            canvas_origin=canvas_origin,
+            canvas_size=canvas_size,
+            pen_z=self.pen_Z,
+            machine_limits=self.machine_limits,
+            on_complete=self._on_external_program_complete
+        )
+
+        # Start program
+        if self.external_handler.start(command, args, timeout):
+            self.active_external_button = button
+            self._enter_external_program(button)
+        else:
+            self.logger.error(f"Failed to start external program: {command}")
+            self.external_handler = None
+            self._error_blink_all()
+
+    def _enter_external_program(self, button: str):
+        """
+        Enter EXTERNAL_PROGRAM state.
+
+        Args:
+            button: Button that triggered the program (E, F, or G)
+        """
+        self.transition(self.STATE_EXTERNAL_PROGRAM)
+
+        # All LEDs off except active button (fast blink)
+        for led in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
+            self.console.set_led(led, 'OFF')
+        self.console.set_led(button, 'FAST_BLINK')
+
+        # Set console to passive mode
         self.console.set_mode('PASSIVE')
         self.console_mode = 'PASSIVE'
 
-        # Execute drawing in background thread
-        import threading
-        threading.Thread(target=self._execute_ellipse_drawing, daemon=True).start()
+    def _on_external_program_complete(self, success: bool):
+        """
+        Callback when external program completes.
 
-    def _execute_ellipse_drawing(self):
-        """Execute ellipse drawing (runs in background thread)."""
-        try:
-            success = draw_ellipse(
-                self.fluidnc,
-                self.point_B,
-                self.point_C,
-                self.pen_Z,
-                self.machine_limits,
-                draw_feedrate=self.config['machine']['draw_feedrate'],
-                pen_feedrate=self.config['machine']['pen_lift_feedrate'],
-                num_segments=self.config['drawing']['ellipse_segments']
-            )
+        Args:
+            success: True if program completed successfully
+        """
+        self.logger.info(f"External program completed (success={success})")
 
-            if success:
-                self.logger.info("Ellipse drawing complete")
-                self.transition(self.STATE_READY)
-                self.console.set_mode('ACTIVE')
-                self.console_mode = 'ACTIVE'
-            else:
-                self.logger.error("Ellipse drawing failed")
-                self.transition(self.STATE_ERROR)
-                self._error_blink_all()
+        self.external_handler = None
+        self.active_external_button = None
 
-        except Exception as e:
-            self.logger.error(f"Error during ellipse drawing: {e}")
+        if success:
+            self.transition(self.STATE_READY)
+            self.console.set_mode('ACTIVE')
+            self.console_mode = 'ACTIVE'
+        else:
             self.transition(self.STATE_ERROR)
             self._error_blink_all()
 

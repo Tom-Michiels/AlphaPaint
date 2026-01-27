@@ -28,6 +28,12 @@ class ConsoleHandler:
         self.read_thread: Optional[threading.Thread] = None
         self.logger = logging.getLogger(__name__)
 
+        # Connection monitoring
+        self._connected = False
+        self._disconnect_callback: Optional[Callable[[], None]] = None
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = 5  # Trigger disconnect after this many errors
+
     def connect(self) -> bool:
         """
         Connect to Console serial port.
@@ -41,29 +47,67 @@ class ConsoleHandler:
                 self.baudrate,
                 timeout=self.timeout
             )
+            self._connected = True
+            self._consecutive_errors = 0
             self.logger.info(f"Connected to Console on {self.port}")
             return True
         except Exception as e:
+            self._connected = False
             self.logger.error(f"Failed to connect to Console: {e}")
             return False
 
     def disconnect(self):
         """Disconnect from Console."""
+        self._connected = False
         self.stop()
         if self.serial and self.serial.is_open:
-            self.serial.close()
+            try:
+                self.serial.close()
+            except Exception:
+                pass  # Ignore errors during close
             self.logger.info("Disconnected from Console")
 
-    def send(self, message: str):
+    def is_connected(self) -> bool:
+        """Check if console is connected and healthy."""
+        return self._connected and self.serial is not None and self.serial.is_open
+
+    def on_disconnect(self, callback: Callable[[], None]):
+        """
+        Register callback for when connection is lost.
+
+        Args:
+            callback: Function to call when connection is lost
+        """
+        self._disconnect_callback = callback
+
+    def _handle_connection_lost(self):
+        """Handle loss of connection to console."""
+        if not self._connected:
+            return  # Already handled
+
+        self._connected = False
+        self.logger.error("Connection to Console lost!")
+
+        # Call disconnect callback if registered
+        if self._disconnect_callback:
+            try:
+                self._disconnect_callback()
+            except Exception as e:
+                self.logger.error(f"Error in disconnect callback: {e}")
+
+    def send(self, message: str) -> bool:
         """
         Send message to Console.
 
         Args:
             message: Message string (will add newline if not present)
+
+        Returns:
+            True if sent successfully, False otherwise
         """
         if not self.serial or not self.serial.is_open:
             self.logger.warning("Cannot send: Console not connected")
-            return
+            return False
 
         if not message.endswith('\n'):
             message += '\n'
@@ -71,8 +115,22 @@ class ConsoleHandler:
         try:
             self.serial.write(message.encode('utf-8'))
             self.logger.debug(f"Console TX: {message.strip()}")
+            self._consecutive_errors = 0  # Reset error count on success
+            return True
+        except serial.SerialException as e:
+            self.logger.error(f"Serial error sending to Console: {e}")
+            self._handle_connection_lost()
+            return False
+        except OSError as e:
+            self.logger.error(f"OS error sending to Console: {e}")
+            self._handle_connection_lost()
+            return False
         except Exception as e:
             self.logger.error(f"Failed to send to Console: {e}")
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self._max_consecutive_errors:
+                self._handle_connection_lost()
+            return False
 
     def set_led(self, led: str, state: str):
         """
@@ -145,15 +203,37 @@ class ConsoleHandler:
         """Background thread for reading Console messages."""
         while self.running:
             try:
-                if self.serial and self.serial.is_open and self.serial.in_waiting:
+                if not self.serial or not self.serial.is_open:
+                    self.logger.warning("Serial port closed, exiting read loop")
+                    self._handle_connection_lost()
+                    break
+
+                if self.serial.in_waiting:
                     line = self.serial.readline().decode('utf-8', errors='ignore').strip()
                     if line:
                         self.logger.debug(f"Console RX: {line}")
                         self._parse_message(line)
+                    self._consecutive_errors = 0  # Reset on successful read
                 else:
                     time.sleep(0.01)  # Small delay to avoid busy waiting
+
+            except serial.SerialException as e:
+                self.logger.error(f"Serial error reading from Console: {e}")
+                self._handle_connection_lost()
+                break
+
+            except OSError as e:
+                # Common when USB device is unplugged
+                self.logger.error(f"OS error reading from Console: {e}")
+                self._handle_connection_lost()
+                break
+
             except Exception as e:
                 self.logger.error(f"Error reading from Console: {e}")
+                self._consecutive_errors += 1
+                if self._consecutive_errors >= self._max_consecutive_errors:
+                    self._handle_connection_lost()
+                    break
                 time.sleep(0.1)
 
     def _parse_message(self, message: str):
@@ -170,9 +250,14 @@ class ConsoleHandler:
             AXIS:X:SELECTED
             PRECISION:X:ON
         """
+        # Skip ESP-IDF log messages (contain ANSI codes or start with log level indicators)
+        # These look like: [0;32mI (12345) TAG: message
+        if message.startswith('[0;') or message.startswith('\x1b['):
+            return  # Skip ANSI-colored ESP-IDF log output
+
         parts = message.split(':')
         if len(parts) < 2:
-            self.logger.warning(f"Invalid message format: {message}")
+            # Not a protocol message - silently ignore
             return
 
         msg_type = parts[0]
@@ -185,8 +270,6 @@ class ConsoleHandler:
             except Exception as e:
                 self.logger.error(f"Error in callback for {msg_type}: {e}")
                 self.logger.error(f"Message was: {message}")
-        else:
-            self.logger.debug(f"No callback registered for message type: {msg_type}")
 
     def identify(self) -> bool:
         """

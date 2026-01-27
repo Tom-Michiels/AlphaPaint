@@ -12,6 +12,7 @@ import logging
 import signal
 import glob
 import yaml
+import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -21,19 +22,35 @@ from lib import ConsoleHandler, FluidNCHandler, StateMachine
 class AlphaPaintDaemon:
     """Main daemon class."""
 
-    def __init__(self, config_path: str = "config.yaml"):
+    def __init__(self, config_path: str = None):
         """
         Initialize daemon.
 
         Args:
-            config_path: Path to configuration file
+            config_path: Path to configuration file. If None, tries config.dev.yaml
+                         first, then falls back to config.yaml
         """
+        if config_path is None:
+            # Check for development config first (relative to script location)
+            script_dir = Path(__file__).parent
+            dev_config = script_dir / "config.dev.yaml"
+            prod_config = script_dir / "config.yaml"
+            if dev_config.exists():
+                config_path = str(dev_config)
+            else:
+                config_path = str(prod_config)
         self.config = self._load_config(config_path)
         self.console: Optional[ConsoleHandler] = None
         self.fluidnc: Optional[FluidNCHandler] = None
         self.state_machine: Optional[StateMachine] = None
         self.running = False
         self.logger = logging.getLogger(__name__)
+
+        # Connection state tracking
+        self._console_port: Optional[str] = None
+        self._fluidnc_port: Optional[str] = None
+        self._needs_reconnect = False
+        self._reconnect_lock = threading.Lock()
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -52,13 +69,13 @@ class AlphaPaintDaemon:
         try:
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
-                print(f"Configuration loaded from {config_path}")
+                print(f"Configuration loaded from {config_path}", file=sys.stderr)
                 return config
         except FileNotFoundError:
-            print(f"Warning: Config file {config_path} not found, using defaults")
+            print(f"Warning: Config file {config_path} not found, using defaults", file=sys.stderr)
             return self._default_config()
         except Exception as e:
-            print(f"Error loading config: {e}")
+            print(f"Error loading config: {e}", file=sys.stderr)
             return self._default_config()
 
     def _default_config(self) -> dict:
@@ -109,6 +126,7 @@ class AlphaPaintDaemon:
                 file_handler.setFormatter(
                     logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
                 )
+                file_handler.setLevel(log_level)
                 logging.getLogger().addHandler(file_handler)
                 self.logger.info(f"Logging to file: {log_file}")
             except Exception as e:
@@ -124,6 +142,14 @@ class AlphaPaintDaemon:
         """
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
+
+    def _on_console_disconnected(self):
+        """Called when the console connection is lost."""
+        with self._reconnect_lock:
+            if self._needs_reconnect:
+                return  # Already handling reconnection
+            self._needs_reconnect = True
+            self.logger.warning("Console disconnected - will attempt reconnection")
 
     def _scan_serial_ports(self) -> list:
         """
@@ -236,6 +262,104 @@ class AlphaPaintDaemon:
             self.logger.error(f"Could not find: {', '.join(missing)}")
             return None, None
 
+    def _cleanup_connections(self):
+        """Clean up all connections."""
+        if self.state_machine:
+            try:
+                self.state_machine.stop()
+            except Exception as e:
+                self.logger.debug(f"Error stopping state machine: {e}")
+            self.state_machine = None
+
+        if self.console:
+            try:
+                self.console.disconnect()
+            except Exception as e:
+                self.logger.debug(f"Error disconnecting console: {e}")
+            self.console = None
+
+        if self.fluidnc:
+            try:
+                self.fluidnc.disconnect()
+            except Exception as e:
+                self.logger.debug(f"Error disconnecting FluidNC: {e}")
+            self.fluidnc = None
+
+    def _try_reconnect_console(self) -> bool:
+        """
+        Try to reconnect to the console on the same port.
+
+        Returns:
+            True if reconnection successful, False otherwise
+        """
+        if not self._console_port:
+            return False
+
+        self.logger.info(f"Attempting to reconnect to Console on {self._console_port}...")
+
+        # First, clean up existing connections
+        self._cleanup_connections()
+
+        # Wait a moment for the device to be ready
+        time.sleep(1.0)
+
+        # Try to reconnect to console on same port
+        try:
+            self.console = ConsoleHandler(
+                self._console_port,
+                self.config['serial']['baud_rate'],
+                self.config['serial']['timeout']
+            )
+            if not self.console.connect():
+                self.logger.error("Failed to reconnect to Console")
+                self.console = None
+                return False
+
+            # Register disconnect callback
+            self.console.on_disconnect(self._on_console_disconnected)
+
+        except Exception as e:
+            self.logger.error(f"Error reconnecting to Console: {e}")
+            self.console = None
+            return False
+
+        # Reconnect to FluidNC (it should still be there)
+        try:
+            self.fluidnc = FluidNCHandler(
+                self._fluidnc_port,
+                self.config['serial']['baud_rate'],
+                self.config['serial']['timeout']
+            )
+            if not self.fluidnc.connect():
+                self.logger.error("Failed to reconnect to FluidNC")
+                self.console.disconnect()
+                self.console = None
+                self.fluidnc = None
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error reconnecting to FluidNC: {e}")
+            self.console.disconnect()
+            self.console = None
+            self.fluidnc = None
+            return False
+
+        # Recreate state machine
+        self.state_machine = StateMachine(
+            self.console,
+            self.fluidnc,
+            self.config
+        )
+
+        # Start Console read thread
+        self.console.start()
+
+        # Start state machine
+        self.state_machine.start()
+
+        self.logger.info("Successfully reconnected to Console")
+        return True
+
     def run(self):
         """Main daemon loop."""
         self._setup_logging()
@@ -247,6 +371,10 @@ class AlphaPaintDaemon:
 
         while self.running:
             try:
+                # Reset reconnect flag
+                with self._reconnect_lock:
+                    self._needs_reconnect = False
+
                 # Scan and connect to devices
                 console_port, fluidnc_port = self._scan_and_connect()
 
@@ -256,6 +384,10 @@ class AlphaPaintDaemon:
                     )
                     time.sleep(self.config['serial']['reconnect_delay'])
                     continue
+
+                # Store ports for reconnection
+                self._console_port = console_port
+                self._fluidnc_port = fluidnc_port
 
                 # Connect to Console
                 self.console = ConsoleHandler(
@@ -267,6 +399,9 @@ class AlphaPaintDaemon:
                     self.logger.error("Failed to connect to Console")
                     time.sleep(self.config['serial']['reconnect_delay'])
                     continue
+
+                # Register disconnect callback
+                self.console.on_disconnect(self._on_console_disconnected)
 
                 # Connect to FluidNC
                 self.fluidnc = FluidNCHandler(
@@ -295,12 +430,35 @@ class AlphaPaintDaemon:
 
                 self.logger.info("Daemon running - devices connected")
 
-                # Main loop - just keep running
+                # Main loop - monitor connections
                 while self.running:
                     time.sleep(0.1)
 
-                    # TODO: Add connection monitoring
-                    # Check if devices are still connected, reconnect if needed
+                    # Check if reconnection is needed
+                    with self._reconnect_lock:
+                        needs_reconnect = self._needs_reconnect
+
+                    if needs_reconnect:
+                        self.logger.info("Reconnection requested, attempting...")
+
+                        # Try quick reconnect first (same port)
+                        reconnect_attempts = 0
+                        max_attempts = 3
+
+                        while reconnect_attempts < max_attempts and self.running:
+                            reconnect_attempts += 1
+                            self.logger.info(f"Reconnect attempt {reconnect_attempts}/{max_attempts}")
+
+                            if self._try_reconnect_console():
+                                with self._reconnect_lock:
+                                    self._needs_reconnect = False
+                                break
+
+                            time.sleep(self.config['serial']['reconnect_delay'])
+
+                        if reconnect_attempts >= max_attempts:
+                            self.logger.warning("Quick reconnect failed, will rescan for devices")
+                            break  # Exit inner loop to rescan
 
             except KeyboardInterrupt:
                 self.logger.info("Keyboard interrupt received")
@@ -312,21 +470,15 @@ class AlphaPaintDaemon:
 
             finally:
                 # Cleanup
-                if self.console:
-                    self.console.disconnect()
-                    self.console = None
-                if self.fluidnc:
-                    self.fluidnc.disconnect()
-                    self.fluidnc = None
-                self.state_machine = None
+                self._cleanup_connections()
 
         self.logger.info("AlphaPaint Daemon stopped")
 
 
 def main():
     """Main entry point."""
-    # Get config path from command line or use default
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    # Get config path from command line, or None to use auto-detection
+    config_path = sys.argv[1] if len(sys.argv) > 1 else None
 
     # Create and run daemon
     daemon = AlphaPaintDaemon(config_path)

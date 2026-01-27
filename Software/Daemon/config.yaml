@@ -25,3 +25,28 @@ logging:
 debugging:
   enable_console_echo: false  # Echo Console messages to log
   enable_fluidnc_echo: false  # Echo FluidNC messages to log
+
+# External drawing programs configuration
+# These programs are triggered by buttons E, F, G when enabled.
+# Programs communicate via stdin/stdout JSON protocol.
+external_programs:
+  button_e:
+    enabled: false            # Set to true to use external program instead of line drawing
+    name: "Program 1"         # Human-readable name for logging
+    command: ""               # Path to executable (e.g., /home/pi/programs/spiral.py)
+    args: []                  # Command line arguments
+    timeout: 300              # Maximum runtime in seconds (0 = unlimited)
+
+  button_f:
+    enabled: false            # Set to true to use external program instead of ellipse drawing
+    name: "Program 2"
+    command: ""
+    args: []
+    timeout: 300
+
+  button_g:
+    enabled: false            # Button G only works with external programs
+    name: "Program 3"
+    command: ""
+    args: []
+    timeout: 300

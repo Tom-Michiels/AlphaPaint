@@ -1,0 +1,50 @@
+# AlphaPaint Daemon Development Configuration
+# This file overrides config.yaml when present
+
+serial:
+  baud_rate: 115200
+  timeout: 1.0
+  reconnect_delay: 5.0
+
+machine:
+  pen_z_default: 0.5
+  jog_feedrate: 10000
+  draw_feedrate: 3000
+  pen_lift_feedrate: 10000
+
+drawing:
+  ellipse_segments: 36
+  min_position_delta: 0.01
+
+logging:
+  level: DEBUG              # More verbose for development
+  file: /var/log/alphapaint-daemon.log
+  max_size: 10485760
+  backup_count: 5
+
+debugging:
+  enable_console_echo: true   # Echo messages for debugging
+  enable_fluidnc_echo: true
+
+# External drawing programs - enabled for testing
+external_programs:
+  button_e:
+    enabled: true
+    name: "Spiral"
+    command: "/home/tom/AlphaPaint/Software/Programs/spiral.py"
+    args: []
+    timeout: 300
+
+  button_f:
+    enabled: true
+    name: "Grid"
+    command: "/home/tom/AlphaPaint/Software/Programs/grid.py"
+    args: []
+    timeout: 300
+
+  button_g:
+    enabled: true
+    name: "Star"
+    command: "/home/tom/AlphaPaint/Software/Programs/star.py"
+    args: []
+    timeout: 300
