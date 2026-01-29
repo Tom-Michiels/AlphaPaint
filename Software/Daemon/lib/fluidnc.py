@@ -57,6 +57,18 @@ class FluidNCHandler:
             )
             time.sleep(2.0)  # Wait for FluidNC to initialize
             self.logger.info(f"Connected to FluidNC on {self.port}")
+
+            # Send soft reset to clear any stuck state
+            self.serial.write(b'\x18')
+            self.logger.info("Soft reset sent to clear any stuck state")
+            time.sleep(2.0)  # Wait for reset to complete
+            self.serial.reset_input_buffer()  # Clear any startup messages
+
+            # Disable auto-report to prevent flooding
+            self.serial.write(b'$Report/Interval=0\n')
+            time.sleep(0.1)
+            self.serial.reset_input_buffer()
+
             return True
         except Exception as e:
             self.logger.error(f"Failed to connect to FluidNC: {e}")
@@ -370,6 +382,10 @@ class FluidNCHandler:
         }
 
         with self._serial_lock:
+            # Clear any pending data before sending $$
+            if self.serial:
+                self.serial.reset_input_buffer()
+
             # Send $$ to get settings
             if not self._send_unlocked("$$"):
                 return limits
@@ -378,9 +394,10 @@ class FluidNCHandler:
             start_time = time.time()
             settings = {}
 
-            while time.time() - start_time < 2.0:
+            while time.time() - start_time < 5.0:  # Increased timeout
                 line = self._readline_unlocked(timeout=0.1)
                 if line:
+                    self.logger.debug(f"get_limits received: {line}")
                     # Check for end of settings
                     if line.startswith('ok'):
                         break
@@ -390,6 +407,9 @@ class FluidNCHandler:
                         setting_num = int(match.group(1))
                         value = float(match.group(2))
                         settings[setting_num] = value
+
+            if not settings:
+                self.logger.warning("get_limits: No settings received from FluidNC")
 
         # Extract limits from settings (outside lock - just local data)
         # $130, $131, $132 = max travel for X, Y, Z

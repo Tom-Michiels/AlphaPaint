@@ -612,6 +612,12 @@ class ExternalProgramHandler:
         lift_pen = params.get('lift_pen', True)
         wait_timeout = params.get('timeout', 60.0)
 
+        # If interrupted, skip the wait - just return quickly
+        if self._interrupted:
+            self.logger.info("Program was interrupted, skipping wait_idle")
+            self._done_called = True
+            return {'success': True}
+
         # Wait for all motion to complete before lifting pen
         self.logger.info("Waiting for FluidNC to complete all motion...")
         if not self.fluidnc.wait_idle(timeout=wait_timeout):

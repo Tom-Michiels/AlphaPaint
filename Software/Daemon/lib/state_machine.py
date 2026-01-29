@@ -531,6 +531,12 @@ class StateMachine:
         """
         self.logger.info(f"External program completed (success={success})")
 
+        # If we're no longer in EXTERNAL_PROGRAM state (e.g., re-homing was triggered),
+        # the state machine has already moved on - don't transition
+        if self.state != self.STATE_EXTERNAL_PROGRAM:
+            self.logger.info("State already changed, skipping completion transition")
+            return
+
         self.external_handler = None
         self.active_external_button = None
 
