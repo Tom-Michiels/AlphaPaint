@@ -32,8 +32,9 @@ echo ""
 echo "[1/6] Creating installation directory..."
 mkdir -p "$INSTALL_DIR"
 
-# Copy files
+# Copy files (clean old lib first to remove stale modules/pycache)
 echo "[2/6] Copying daemon files..."
+rm -rf "$INSTALL_DIR/lib"
 cp -r "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/daemon.py" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/config.yaml" "$INSTALL_DIR/"

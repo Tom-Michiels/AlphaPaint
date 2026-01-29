@@ -45,8 +45,8 @@ external_programs:
     timeout: 300
 
   button_g:
-    enabled: false            # Button G only works with external programs
-    name: "Program 3"
-    command: ""
+    enabled: true             # Button G only works with external programs
+    name: "Ekster"
+    command: "/home/tom/AlphaPaint/Software/Programs/ekster.py"
     args: []
     timeout: 300
