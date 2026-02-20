@@ -172,6 +172,29 @@ class ConsoleHandler:
         """
         self.send(f"LIMIT:{axis}:{min_val:.2f}:{max_val:.2f}")
 
+    def reset(self):
+        """
+        Reset Console to initial state.
+
+        This puts the console in a known startup state by:
+        - Setting mode to PASSIVE
+        - Turning off all LEDs
+        - Resetting limits to large defaults (will be overwritten after homing)
+        """
+        # Set passive mode
+        self.set_mode('PASSIVE')
+
+        # Turn off all LEDs
+        for led in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
+            self.set_led(led, 'OFF')
+
+        # Reset limits to large defaults (matching console firmware defaults)
+        # These will be overwritten with real values after homing
+        for axis in ['X', 'Y', 'Z']:
+            self.set_limit(axis, -9999.99, 9999.99)
+
+        self.logger.info("Console reset: mode=PASSIVE, LEDs off, limits reset")
+
     def on_message(self, message_type: str, callback: Callable):
         """
         Register callback for incoming message type.

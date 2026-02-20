@@ -12,8 +12,12 @@ from alphapaint import AlphaPaint
 # Configuration
 #######################################
 
-PIXEL_WIDTH = 800
-PIXEL_HEIGHT = 800
+PIXEL_MAX_DIM = 800
+
+# Pen configuratie
+NUM_PENS = 5
+MIN_STROKES_PER_PEN = 1
+MAX_STROKES_PER_PEN = 10
 
 SCRIBBLE_MIN_SEGMENTS = 1
 SCRIBBLE_MAX_SEGMENTS = 9
@@ -134,10 +138,27 @@ def main():
         ap_w = ap_canvas.width
         ap_h = ap_canvas.height
 
+        # Load and fit target image.
+        target_img = cv2.imread(IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
+        if target_img is None:
+            print("Error loading image.", file=sys.stderr)
+            return
+
+        # Compute pixel canvas dimensions from image aspect ratio.
+        img_h, img_w = target_img.shape[:2]
+        if img_w >= img_h:
+            pixel_width = PIXEL_MAX_DIM
+            pixel_height = int(PIXEL_MAX_DIM * img_h / img_w)
+        else:
+            pixel_height = PIXEL_MAX_DIM
+            pixel_width = int(PIXEL_MAX_DIM * img_w / img_h)
+
+        target_gray = fit_image_on_canvas(target_img, pixel_width, pixel_height)
+
         # Compute pixel-to-mm scale (preserve aspect ratio, center on canvas).
-        scale = min(ap_w / PIXEL_WIDTH, ap_h / PIXEL_HEIGHT)
-        x_offset = (ap_w - PIXEL_WIDTH * scale) / 2
-        y_offset = (ap_h - PIXEL_HEIGHT * scale) / 2
+        scale = min(ap_w / pixel_width, ap_h / pixel_height)
+        x_offset = (ap_w - pixel_width * scale) / 2
+        y_offset = (ap_h - pixel_height * scale) / 2
 
         def pixel_to_canvas(x, y):
             """Convert pixel coordinates to AlphaPaint canvas coordinates (mm)."""
@@ -145,15 +166,8 @@ def main():
             cy = ap_h - (y * scale + y_offset)  # Invert Y
             return cx, cy
 
-        # Load and fit target image.
-        target_img = cv2.imread(IMAGE_PATH, cv2.IMREAD_GRAYSCALE)
-        if target_img is None:
-            print("Error loading image.", file=sys.stderr)
-            return
-        target_gray = fit_image_on_canvas(target_img, PIXEL_WIDTH, PIXEL_HEIGHT)
-
         # Create white canvas (color).
-        canvas = np.full((PIXEL_HEIGHT, PIXEL_WIDTH, 3), 255, dtype=np.uint8)
+        canvas = np.full((pixel_height, pixel_width, 3), 255, dtype=np.uint8)
         try:
             cv2.namedWindow("Canvas", cv2.WINDOW_NORMAL)
             show_gui = True
@@ -161,81 +175,114 @@ def main():
             show_gui = False
 
         total_segments = 0
+        pen_round = 0
 
         while True:
-            # Choose new starting point.
-            start_x, start_y = select_next_start(canvas, target_gray, num_candidates=START_CANDIDATES)
-            current_theta = random.uniform(0, 2*math.pi)
-            current_x, current_y = start_x, start_y
-            scribble_color = tuple(int(c) for c in random.choice(COLORS))
+            # Pick up pen voor deze ronde
+            pen_index = pen_round % NUM_PENS
+            strokes_this_pen = random.randint(MIN_STROKES_PER_PEN, MAX_STROKES_PER_PEN)
+            print(f"=== Pen {pen_index}, planning {strokes_this_pen} strokes ===", file=sys.stderr)
+            ap.pickup_pen(pen_index)
 
-            scribble_start_error = compute_error(canvas, target_gray)
-            scribble_count = 0
+            strokes_done = 0
+            while strokes_done < strokes_this_pen:
+                # Choose new starting point.
+                start_x, start_y = select_next_start(canvas, target_gray, num_candidates=START_CANDIDATES)
+                current_theta = random.uniform(0, 2*math.pi)
+                current_x, current_y = start_x, start_y
+                scribble_color = tuple(int(c) for c in random.choice(COLORS))
 
-            while True:
-                current_error = compute_error(canvas, target_gray)
-                best_error = None
-                best_canvas = None
-                best_endpoint = (None, None)
-                best_new_theta = None
-                best_arc = None
-                for _ in range(SEGMENT_CANDIDATES):
-                    L = random.uniform(SEGMENT_LENGTH_MIN, SEGMENT_LENGTH_MAX)
-                    delta = random.uniform(SEGMENT_DELTA_MIN, SEGMENT_DELTA_MAX)
-                    candidate_canvas, candidate_x, candidate_y, candidate_new_theta, arc_info = draw_curve(
-                        canvas, current_x, current_y, current_theta, L, delta, scribble_color, STROKE_THICKNESS)
-                    err = compute_error(candidate_canvas, target_gray)
-                    if best_error is None or err < best_error:
-                        best_error = err
-                        best_canvas = candidate_canvas
-                        best_endpoint = (candidate_x, candidate_y)
-                        best_new_theta = candidate_new_theta
-                        best_arc = arc_info
+                scribble_start_error = compute_error(canvas, target_gray)
+                scribble_count = 0
 
-                # If no improvement found, skip this scribble entirely
-                if best_error >= current_error:
-                    break
+                while True:
+                    current_error = compute_error(canvas, target_gray)
+                    best_error = None
+                    best_canvas = None
+                    best_endpoint = (None, None)
+                    best_new_theta = None
+                    best_arc = None
+                    for _ in range(SEGMENT_CANDIDATES):
+                        L = random.uniform(SEGMENT_LENGTH_MIN, SEGMENT_LENGTH_MAX)
+                        delta = random.uniform(SEGMENT_DELTA_MIN, SEGMENT_DELTA_MAX)
+                        candidate_canvas, candidate_x, candidate_y, candidate_new_theta, arc_info = draw_curve(
+                            canvas, current_x, current_y, current_theta, L, delta, scribble_color, STROKE_THICKNESS)
+                        err = compute_error(candidate_canvas, target_gray)
+                        if best_error is None or err < best_error:
+                            best_error = err
+                            best_canvas = candidate_canvas
+                            best_endpoint = (candidate_x, candidate_y)
+                            best_new_theta = candidate_new_theta
+                            best_arc = arc_info
 
-                # On first successful segment, move to start and lower pen
-                if scribble_count == 0:
-                    sx, sy = pixel_to_canvas(start_x, start_y)
-                    ap.move_to(sx, sy)
-                    ap.pen_down()
+                    # If no improvement found, skip this scribble entirely
+                    if best_error >= current_error:
+                        break
 
-                canvas = best_canvas
-                prev_x, prev_y = current_x, current_y
-                current_x, current_y = best_endpoint
-                current_theta = best_new_theta
-                scribble_count += 1
-                total_segments += 1
+                    # On first successful segment, move to start and lower pen
+                    if scribble_count == 0:
+                        sx, sy = pixel_to_canvas(start_x, start_y)
+                        ap.move_to(sx, sy)
+                        ap.pen_down()
 
-                if show_gui:
-                    cv2.imshow("Canvas", canvas)
-                print(f"Segment {total_segments:06d}, Scribble segments: {scribble_count}, Error: {best_error}", file=sys.stderr)
+                    canvas = best_canvas
+                    prev_x, prev_y = current_x, current_y
+                    current_x, current_y = best_endpoint
+                    current_theta = best_new_theta
+                    scribble_count += 1
+                    total_segments += 1
 
-                # Send segment to plotter
-                cx, cy = pixel_to_canvas(current_x, current_y)
-                if best_arc is not None:
-                    # I, J = offset from current plotter position to arc center
-                    i_mm = (best_arc["cx"] - prev_x) * scale
-                    j_mm = -(best_arc["cy"] - prev_y) * scale  # Invert Y
-                    clockwise = (best_arc["delta"] > 0)  # delta > 0 = visual CW on screen = G2
-                    ap.draw_arc(cx, cy, i_mm, j_mm, clockwise=clockwise)
-                else:
-                    ap.draw_to(cx, cy)
+                    if show_gui:
+                        cv2.imshow("Canvas", canvas)
+                    print(f"Segment {total_segments:06d}, Scribble segments: {scribble_count}, Error: {best_error}", file=sys.stderr)
 
-                if show_gui and cv2.waitKey(1) & 0xFF == 27:
-                    break
+                    # Send segment to plotter
+                    cx, cy = pixel_to_canvas(current_x, current_y)
+                    if best_arc is not None:
+                        # I, J = offset from current plotter position to arc center
+                        i_mm = (best_arc["cx"] - prev_x) * scale
+                        j_mm = -(best_arc["cy"] - prev_y) * scale  # Invert Y
 
-                new_err = compute_error(canvas, target_gray)
-                improvement = scribble_start_error - new_err
-                if scribble_count >= SCRIBBLE_MIN_SEGMENTS and improvement < scribble_start_error * IMPROVEMENT_THRESHOLD:
-                    break
-                if scribble_count >= SCRIBBLE_MAX_SEGMENTS:
-                    break
+                        # Validate arc geometry before sending
+                        # Radius from I,J offset
+                        radius_ij = math.hypot(i_mm, j_mm)
+                        # Expected endpoint relative to center
+                        px, py = pixel_to_canvas(prev_x, prev_y)
+                        center_x = px + i_mm
+                        center_y = py + j_mm
+                        # Distance from center to endpoint
+                        radius_end = math.hypot(cx - center_x, cy - center_y)
 
-            # Lift pen after scribble is finished.
+                        # Check if radii match (within 0.5mm tolerance)
+                        radius_error = abs(radius_ij - radius_end)
+                        if radius_error < 0.5 and radius_ij > 0.1:
+                            # Arc is valid - Y inversion flips CW/CCW direction
+                            clockwise = (best_arc["delta"] > 0)  # Inverted due to Y-axis flip
+                            ap.draw_arc(cx, cy, i_mm, j_mm, clockwise=clockwise)
+                        else:
+                            # Arc invalid, fall back to line
+                            ap.draw_to(cx, cy)
+                    else:
+                        ap.draw_to(cx, cy)
+
+                    if show_gui and cv2.waitKey(1) & 0xFF == 27:
+                        break
+
+                    new_err = compute_error(canvas, target_gray)
+                    improvement = scribble_start_error - new_err
+                    if scribble_count >= SCRIBBLE_MIN_SEGMENTS and improvement < scribble_start_error * IMPROVEMENT_THRESHOLD:
+                        break
+                    if scribble_count >= SCRIBBLE_MAX_SEGMENTS:
+                        break
+
+                # Lift pen after scribble (fast for quick repositioning within same pen)
+                ap.pen_up_fast()
+                strokes_done += 1
+
+            # Full pen up before returning pen
             ap.pen_up()
+            ap.return_pen(pen_index)
+            pen_round += 1
 
         if show_gui:
             cv2.destroyAllWindows()

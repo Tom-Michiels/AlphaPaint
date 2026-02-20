@@ -5,8 +5,20 @@ import threading
 import logging
 import time
 import re
-import queue
+import collections
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple, Callable
+
+
+@dataclass
+class PendingCommand:
+    """Tracks a command awaiting response from FluidNC."""
+    gcode: str
+    cmd_len: int
+    response_event: threading.Event = field(default_factory=threading.Event)
+    response: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    sent_timestamp: float = 0.0  # When bytes actually went on the wire
 
 
 class FluidNCHandler:
@@ -31,16 +43,44 @@ class FluidNCHandler:
         # Background read thread
         self._read_thread: Optional[threading.Thread] = None
         self._running = False
-        self._response_queue: queue.Queue = queue.Queue()
         self._status_callback: Optional[Callable[[Dict], None]] = None
+
+        # Per-command response tracking (replaces shared queue)
+        self._pending_lock = threading.Lock()
+        self._pending_deque: collections.deque = collections.deque()
 
         # Buffer management for flow control (character-counting protocol)
         self._buffer_size = 128  # FluidNC/Grbl RX buffer size
         self._buffer_used = 0  # Bytes currently in buffer
-        self._pending_commands: list = []  # Track sent command lengths
         self._buffer_lock = threading.Lock()
         self._buffer_space_event = threading.Event()
         self._buffer_space_event.set()  # Initially have space
+
+        # Status request mechanism for thread-safe get_status/get_limits
+        self._status_request = threading.Event()
+        self._status_response: Optional[Dict] = None
+        self._status_ready = threading.Event()
+        self._limits_request = threading.Event()
+        self._limits_response: Optional[Dict] = None
+        self._limits_ready = threading.Event()
+
+        # Cached position from auto-report status updates
+        self._cached_position: Optional[Dict[str, float]] = None
+        self._cached_position_time: float = 0.0
+        self._cached_state: Optional[str] = None
+
+        # Instrumentation counters
+        self._stats = {
+            'ok_delivered': 0,
+            'ok_orphaned': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'status_queries_explicit': 0,
+            'buffer_desyncs': 0,
+            'command_timeouts': 0,
+            'buffer_timeout_leaks_fixed': 0,
+            'ok_recovered': 0,
+        }
 
     def connect(self) -> bool:
         """
@@ -58,11 +98,17 @@ class FluidNCHandler:
             time.sleep(2.0)  # Wait for FluidNC to initialize
             self.logger.info(f"Connected to FluidNC on {self.port}")
 
-            # Send soft reset to clear any stuck state
-            self.serial.write(b'\x18')
+            # Full reset sequence to clear any stuck state
+            self.serial.write(b'\x18')  # Ctrl-X soft reset
             self.logger.info("Soft reset sent to clear any stuck state")
             time.sleep(2.0)  # Wait for reset to complete
-            self.serial.reset_input_buffer()  # Clear any startup messages
+            self.serial.reset_input_buffer()  # Clear startup messages
+
+            # Unlock if in ALARM state (e.g. after previous crash)
+            self.serial.write(b'$X\n')
+            time.sleep(0.5)
+            self.serial.reset_input_buffer()
+            self.logger.info("Alarm unlock ($X) sent")
 
             # Disable auto-report to prevent flooding
             self.serial.write(b'$Report/Interval=0\n')
@@ -89,15 +135,26 @@ class FluidNCHandler:
         # Reset buffer tracking
         with self._buffer_lock:
             self._buffer_used = 0
-            self._pending_commands.clear()
             self._buffer_space_event.set()
+            self.logger.info(f"Buffer tracking reset: 0/{self._buffer_size} bytes")
 
-        # Clear response queue
-        while not self._response_queue.empty():
-            try:
-                self._response_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Clear pending commands
+        with self._pending_lock:
+            old_count = len(self._pending_deque)
+            self._pending_deque.clear()
+            if old_count > 0:
+                self.logger.warning(f"Cleared {old_count} pending commands on start")
+
+        # Reset cached position
+        self._cached_position = None
+        self._cached_position_time = 0.0
+        self._cached_state = None
+
+        # Reset status request state
+        self._status_request.clear()
+        self._status_ready.clear()
+        self._limits_request.clear()
+        self._limits_ready.clear()
 
         self._running = True
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -105,11 +162,26 @@ class FluidNCHandler:
         self.logger.info("FluidNC read thread started")
 
     def stop(self):
-        """Stop background read thread."""
+        """Stop background read thread and clean up pending commands."""
         if not self._running:
             return
 
         self._running = False
+
+        # Wake up any waiting status/limits requests
+        self._status_ready.set()
+        self._limits_ready.set()
+
+        # Wake up all pending command waiters with shutdown error
+        with self._pending_lock:
+            for pending in self._pending_deque:
+                pending.response = "error:shutdown"
+                pending.response_event.set()
+            self._pending_deque.clear()
+
+        # Wake up buffer waiters
+        self._buffer_space_event.set()
+
         if self._read_thread:
             self._read_thread.join(timeout=2.0)
             self._read_thread = None
@@ -134,22 +206,182 @@ class FluidNCHandler:
         Returns:
             True if command sent successfully
         """
-        return self.send(f"$Report/Interval={interval_ms}")
+        # Configure status report to include buffer data (Bf:)
+        # $10=3 means: MPos (1) + Buffer data (2) = 3
+        self.send_gcode("$10=3", wait_ok=False)
+        time.sleep(0.05)
+        return self.send_gcode(f"$Report/Interval={interval_ms}", wait_ok=False)
 
     def _read_loop(self):
         """Background thread that reads from FluidNC and dispatches messages."""
+        last_stale_check = time.time()
+        last_buffer_log = time.time()
+        STALE_CHECK_INTERVAL = 5.0  # Check every 5 seconds
+        STALE_TIMEOUT = 30.0  # Commands older than 30 seconds are stale
+        BUFFER_LOG_INTERVAL = 2.0  # Log buffer state every 2 seconds
+
         while self._running:
             try:
+                # Check for status request from main thread
+                if self._status_request.is_set():
+                    self._handle_status_request()
+                    continue
+
+                # Check for limits request from main thread
+                if self._limits_request.is_set():
+                    self._handle_limits_request()
+                    continue
+
+                # Normal read loop
                 if self.serial and self.serial.is_open and self.serial.in_waiting:
                     line = self.serial.readline().decode('utf-8', errors='ignore').strip()
                     if line:
-                        self.logger.debug(f"FluidNC RX: {line}")
+                        self.logger.debug(f"FluidNC RX: '{line}' (len={len(line)})")
                         self._dispatch_message(line)
                 else:
                     time.sleep(0.01)
+
+                # Periodic stale command check
+                if time.time() - last_stale_check > STALE_CHECK_INTERVAL:
+                    last_stale_check = time.time()
+                    self._check_stale_commands(STALE_TIMEOUT)
+
+                # Periodic buffer state logging
+                if time.time() - last_buffer_log > BUFFER_LOG_INTERVAL:
+                    last_buffer_log = time.time()
+                    with self._buffer_lock:
+                        buffer_used = self._buffer_used
+                    with self._pending_lock:
+                        pending_count = len(self._pending_deque)
+                        pending_cmds = [p.gcode[:20] for p in self._pending_deque]
+                    self.logger.info(f"Buffer state: {buffer_used}/{self._buffer_size} bytes, "
+                                   f"{pending_count} pending: {pending_cmds}")
+                    self.logger.info(f"Stats: {self._stats}")
+
             except Exception as e:
                 self.logger.error(f"Error in FluidNC read loop: {e}")
                 time.sleep(0.1)
+
+    def _drain_and_dispatch_unlocked(self):
+        """Read and dispatch all currently buffered serial data.
+
+        Routes 'ok' and 'error:' responses to _deliver_response() so they
+        are not lost. Must be called with _serial_lock held.
+        """
+        drained = 0
+        while self.serial and self.serial.in_waiting:
+            line = self._readline_unlocked(timeout=0.05)
+            if line:
+                drained += 1
+                self.logger.debug(f"Drained: {line}")
+                self._dispatch_message(line)
+            else:
+                break
+        if drained > 0:
+            self.logger.debug(f"Drained {drained} lines from serial buffer")
+
+    def _handle_status_request(self):
+        """Handle a status query request from the main thread."""
+        self._status_request.clear()
+
+        with self._serial_lock:
+            # Drain and dispatch buffered data (preserves ok responses)
+            self._drain_and_dispatch_unlocked()
+
+            if not self._send_unlocked("?"):
+                self._status_response = None
+                self._status_ready.set()
+                return
+
+            # Wait for status response
+            start_time = time.time()
+            while time.time() - start_time < 0.5:
+                line = self._readline_unlocked(timeout=0.1)
+                if not line:
+                    continue
+                # Route non-status responses properly
+                if not line.startswith('<'):
+                    self._dispatch_message(line)
+                    continue
+                if line.startswith('<'):
+                    self._status_response = self._parse_status(line)
+                    self._status_ready.set()
+                    return
+
+            self._status_response = None
+            self._status_ready.set()
+
+    def _handle_limits_request(self):
+        """Handle a limits query request from the main thread."""
+        self._limits_request.clear()
+
+        # Default limits
+        limits = {
+            'X': (0.0, 300.0),
+            'Y': (-150.0, 150.0),
+            'Z': (0.0, 50.0)
+        }
+
+        with self._serial_lock:
+            # Drain and dispatch buffered data (preserves ok responses)
+            self._drain_and_dispatch_unlocked()
+
+            if not self._send_unlocked("$$"):
+                self._limits_response = limits
+                self._limits_ready.set()
+                return
+
+            # Read settings until 'ok' or timeout
+            start_time = time.time()
+            settings = {}
+
+            while time.time() - start_time < 5.0:
+                line = self._readline_unlocked(timeout=0.1)
+                if line:
+                    self.logger.debug(f"get_limits received: {line}")
+                    if line.startswith('ok'):
+                        break
+                    match = re.match(r'\$(\d+)=([\d.-]+)', line)
+                    if match:
+                        setting_num = int(match.group(1))
+                        value = float(match.group(2))
+                        settings[setting_num] = value
+
+        # Extract limits from settings
+        if 130 in settings:
+            limits['X'] = (0.0, settings[130])
+        if 131 in settings:
+            limits['Y'] = (0.0, settings[131])
+        if 132 in settings:
+            limits['Z'] = (0.0, settings[132])
+
+        self._limits_response = limits
+        self._limits_ready.set()
+
+    def _check_stale_commands(self, timeout: float):
+        """Check for commands that have been pending too long."""
+        now = time.time()
+        with self._pending_lock:
+            stale = []
+            for pending in self._pending_deque:
+                if (now - pending.timestamp) > timeout:
+                    stale.append(pending)
+
+            for pending in stale:
+                self.logger.warning(f"Stale command timeout ({timeout}s): {pending.gcode}")
+
+                # Update buffer tracking
+                with self._buffer_lock:
+                    self._buffer_used -= pending.cmd_len
+                    if self._buffer_used < 0:
+                        self._buffer_used = 0
+                    if self._buffer_used < self._buffer_size - 50:
+                        self._buffer_space_event.set()
+
+                # Deliver timeout error to waiting caller
+                pending.response = "error:stale_timeout"
+                pending.response_event.set()
+                self._pending_deque.remove(pending)
 
     def _dispatch_message(self, line: str):
         """
@@ -159,32 +391,145 @@ class FluidNCHandler:
             line: Raw line from FluidNC
         """
         if line.startswith('<'):
-            # Status report - call callback
+            # Status report - call callback and sync buffer tracking
+            self.logger.debug(f"Dispatch: status report")
             status = self._parse_status(line)
-            if status and self._status_callback:
-                try:
-                    self._status_callback(status)
-                except Exception as e:
-                    self.logger.error(f"Error in status callback: {e}")
-        elif line.startswith('ok') or line.startswith('error:'):
-            # Command acknowledged - free buffer space
-            self._on_command_ack()
-            # Command response - put in queue for waiting commands
-            self._response_queue.put(line)
-        # Other messages (info, welcome, etc.) are just logged
+            if status:
+                # Cache position from auto-report for non-blocking queries
+                if 'position' in status:
+                    self._cached_position = status['position']
+                    self._cached_position_time = time.time()
+                if 'state' in status:
+                    self._cached_state = status['state']
 
-    def _on_command_ack(self):
-        """Called when FluidNC acknowledges a command (ok or error)."""
+                # Sync buffer tracking with real FluidNC buffer state
+                if 'buffer' in status:
+                    self._sync_buffer_from_status(status['buffer'])
+
+                if self._status_callback:
+                    try:
+                        self._status_callback(status)
+                    except Exception as e:
+                        self.logger.error(f"Error in status callback: {e}")
+        elif line.startswith('ok') or line.startswith('error:'):
+            # Command acknowledged - deliver to waiting caller
+            self.logger.debug(f"Dispatch: command response '{line}'")
+            self._deliver_response(line)
+        else:
+            # Other messages (info, welcome, etc.)
+            self.logger.debug(f"Dispatch: other message '{line}'")
+
+    def _sync_buffer_from_status(self, buffer_info: Dict):
+        """
+        Synchronize buffer tracking with real FluidNC buffer state.
+        This provides automatic recovery from any tracking desync.
+        Also recovers from lost "ok" responses: if FluidNC's buffer is empty
+        but we have old pending commands, the "ok" was lost in serial transit.
+
+        Args:
+            buffer_info: Dict with 'planner_available' and 'rx_available' keys
+        """
+        rx_available = buffer_info.get('rx_available', 0)
+        planner_available = buffer_info.get('planner_available', 0)
+        self.logger.debug(f"Bf: planner={planner_available}, rx_available={rx_available}")
+        # rx_available is how many bytes are FREE in FluidNC's buffer
+        # Our buffer_used should be: buffer_size - rx_available
+        real_buffer_used = self._buffer_size - rx_available
+
+        # Check if any command was sent very recently (within 1.5x auto-report
+        # interval). If so, this auto-report may pre-date the send at the UART
+        # level, so skip desync correction to avoid undoing legitimate buffer
+        # reservations.
+        now = time.time()
+        recent_send = False
+        with self._pending_lock:
+            for p in self._pending_deque:
+                if p.sent_timestamp > 0 and (now - p.sent_timestamp) < 0.15:
+                    recent_send = True
+                    break
+
         with self._buffer_lock:
-            if self._pending_commands:
-                cmd_len = self._pending_commands.pop(0)
-                self._buffer_used -= cmd_len
-                if self._buffer_used < 0:
-                    self._buffer_used = 0  # Safety
-                self.logger.debug(f"Buffer freed {cmd_len} bytes, now {self._buffer_used}/{self._buffer_size}")
-            # Signal that there's buffer space available
-            if self._buffer_used < self._buffer_size - 50:  # Leave some margin
-                self._buffer_space_event.set()
+            diff = abs(real_buffer_used - self._buffer_used)
+            if diff > 5:
+                if recent_send:
+                    self.logger.debug(
+                        f"Buffer diff tracked={self._buffer_used} real={real_buffer_used} "
+                        f"(skipping correction - recent send within 150ms)")
+                else:
+                    self._stats['buffer_desyncs'] += 1
+                    self.logger.warning(f"Buffer tracking desync detected: "
+                                      f"tracked={self._buffer_used}, real={real_buffer_used}, "
+                                      f"correcting to {real_buffer_used}")
+                    self._buffer_used = max(0, real_buffer_used)
+                    if self._buffer_used < self._buffer_size - 50:
+                        self._buffer_space_event.set()
+                    else:
+                        self._buffer_space_event.clear()
+            elif real_buffer_used != self._buffer_used:
+                # Small difference (<=5 bytes) - silently correct
+                self._buffer_used = max(0, real_buffer_used)
+                if self._buffer_used < self._buffer_size - 50:
+                    self._buffer_space_event.set()
+
+        # Recover lost "ok" responses: if FluidNC's RX buffer is completely
+        # empty but we have pending commands older than 5 seconds (by
+        # sent_timestamp), their "ok" was lost during serial transmission
+        # (e.g. UART TX collision with auto-report). Deliver synthetic "ok"
+        # to unblock callers and keep the FIFO in sync.
+        if rx_available >= self._buffer_size:
+            with self._pending_lock:
+                while self._pending_deque:
+                    oldest = self._pending_deque[0]
+                    if oldest.sent_timestamp <= 0:
+                        break  # Not yet sent (defensive)
+                    age = now - oldest.sent_timestamp
+                    if age > 5.0:
+                        stale = self._pending_deque.popleft()
+                        self.logger.warning(
+                            f"Recovering lost 'ok' for '{stale.gcode}' "
+                            f"(age={age:.1f}s since send, FluidNC buffer empty)")
+                        # Deliver synthetic ok - buffer accounting already
+                        # corrected above via real_buffer_used sync
+                        stale.response = 'ok'
+                        stale.response_event.set()
+                        self._stats['ok_recovered'] += 1
+                    else:
+                        break
+
+    def _deliver_response(self, response: str):
+        """
+        Deliver response to the oldest pending command (FIFO order).
+        Also updates buffer tracking.
+
+        Args:
+            response: The 'ok' or 'error:...' response from FluidNC
+        """
+        with self._pending_lock:
+            if self._pending_deque:
+                pending = self._pending_deque.popleft()
+                cmd_len = pending.cmd_len
+                cmd_gcode = pending.gcode
+
+                # Update buffer tracking
+                with self._buffer_lock:
+                    old_used = self._buffer_used
+                    self._buffer_used -= cmd_len
+                    if self._buffer_used < 0:
+                        self._buffer_used = 0  # Safety
+                    self.logger.debug(f"Response '{response}' for cmd '{cmd_gcode}': "
+                                    f"buffer {old_used} -> {self._buffer_used}/{self._buffer_size}")
+                    if self._buffer_used < self._buffer_size - 50:
+                        self._buffer_space_event.set()
+                        self.logger.debug("Buffer space event set")
+
+                # Deliver response to waiting caller
+                pending.response = response
+                pending.response_event.set()
+                self._stats['ok_delivered'] += 1
+                self.logger.debug(f"Response event set for cmd '{cmd_gcode}'")
+            else:
+                self._stats['ok_orphaned'] += 1
+                self.logger.warning(f"Received response with no pending command: {response}")
 
     def _send_unlocked(self, command: str) -> bool:
         """
@@ -228,7 +573,7 @@ class FluidNCHandler:
     def send_gcode(self, gcode: str, wait_ok: bool = True, timeout: float = 10.0) -> bool:
         """
         Send G-code command with proper flow control.
-        Thread-safe: uses buffer management to prevent overflow.
+        Thread-safe: uses per-command tracking to ensure correct response delivery.
 
         Args:
             gcode: G-code command
@@ -242,57 +587,91 @@ class FluidNCHandler:
         cmd_with_newline = gcode if gcode.endswith('\n') else gcode + '\n'
         cmd_len = len(cmd_with_newline)
 
+        # Create pending command tracker
+        pending = PendingCommand(gcode=gcode, cmd_len=cmd_len)
+
         # Wait for buffer space if needed (flow control)
+        # Read-only check: do NOT increment _buffer_used here.
+        # The increment happens atomically with the serial write below.
         if self._running:
             start_time = time.time()
+            wait_logged = False
             while True:
                 with self._buffer_lock:
                     if self._buffer_used + cmd_len <= self._buffer_size:
-                        # Have space - track this command
-                        self._buffer_used += cmd_len
-                        self._pending_commands.append(cmd_len)
-                        self.logger.debug(f"Buffer: +{cmd_len} bytes, now {self._buffer_used}/{self._buffer_size}")
-                        if self._buffer_used >= self._buffer_size - 50:
-                            self._buffer_space_event.clear()
-                        break
+                        break  # Space available - proceed to send
+                    else:
+                        if not wait_logged:
+                            self.logger.warning(f"Buffer full ({self._buffer_used}/{self._buffer_size}), waiting to send: {gcode}")
+                            wait_logged = True
 
                 # No space - wait for acknowledgment
                 if time.time() - start_time > timeout:
-                    self.logger.error(f"Timeout waiting for buffer space to send: {gcode}")
+                    with self._buffer_lock:
+                        self.logger.error(f"Timeout waiting for buffer space to send: {gcode} "
+                                        f"(buffer={self._buffer_used}/{self._buffer_size})")
+                    with self._pending_lock:
+                        pending_cmds = [p.gcode for p in self._pending_deque]
+                        self.logger.error(f"Pending commands at timeout: {pending_cmds}")
                     return False
 
                 # Wait for buffer space event with short timeout
                 self._buffer_space_event.wait(timeout=0.1)
 
-        # Send the command
+        # Atomic: send command + update buffer tracking + register pending.
+        # All under _serial_lock so auto-report sync cannot see an incremented
+        # buffer before the command is actually on the wire.
         with self._serial_lock:
             if not self._send_unlocked(gcode):
-                # Failed to send - remove from tracking
-                if self._running:
-                    with self._buffer_lock:
-                        if self._pending_commands and self._pending_commands[-1] == cmd_len:
-                            self._pending_commands.pop()
-                            self._buffer_used -= cmd_len
-                return False
+                return False  # Nothing to clean up - no state modified yet
+
+            # Command is on the wire - register in pending FIRST (so grace
+            # period check in _sync_buffer_from_status can find it), then
+            # increment buffer tracking.
+            pending.sent_timestamp = time.time()
+            with self._pending_lock:
+                self._pending_deque.append(pending)
+            with self._buffer_lock:
+                old_used = self._buffer_used
+                self._buffer_used += cmd_len
+                self.logger.debug(f"Buffer space OK for '{gcode}': {old_used} + {cmd_len} = {self._buffer_used}/{self._buffer_size}")
+                if self._buffer_used >= self._buffer_size - 50:
+                    self._buffer_space_event.clear()
 
         if not wait_ok:
             return True
 
-        # Wait for 'ok' or 'error' response
+        # Wait for response on this specific command
         if self._running:
-            # Background thread is handling reads - use queue
-            try:
-                response = self._response_queue.get(timeout=timeout)
-                if response.startswith('ok'):
+            # Background thread will deliver response via pending.response_event
+            if pending.response_event.wait(timeout=timeout):
+                response = pending.response
+                if response and response.startswith('ok'):
                     return True
-                elif response.startswith('error:'):
+                elif response and response.startswith('error:'):
                     self.logger.error(f"FluidNC error: {response}")
                     return False
-            except queue.Empty:
+                else:
+                    self.logger.error(f"Unexpected response to {gcode}: {response}")
+                    return False
+            else:
                 self.logger.error(f"Timeout waiting for response to: {gcode}")
+                self._stats['command_timeouts'] += 1
+                # Do NOT remove from pending - leave it for the late "ok".
+                # Removing it causes a FIFO shift where the late "ok" matches
+                # the NEXT command, cascading into complete desync.
+                # The lost-ok recovery in _sync_buffer_from_status() will
+                # clean up if the "ok" was truly lost.
                 return False
         else:
             # No background thread - read directly (no flow control)
+            # Remove from pending deque since we're handling response directly
+            with self._pending_lock:
+                try:
+                    self._pending_deque.remove(pending)
+                except ValueError:
+                    pass
+
             with self._serial_lock:
                 start_time = time.time()
                 while time.time() - start_time < timeout:
@@ -364,94 +743,169 @@ class FluidNCHandler:
             True if homing successful, False otherwise
         """
         self.logger.info("Starting homing sequence")
-        return self.send_gcode("$H", wait_ok=True, timeout=30.0)
+        return self.send_gcode("$H", wait_ok=True, timeout=60.0)
 
     def get_limits(self) -> Dict[str, Tuple[float, float]]:
         """
         Query machine limits from FluidNC settings.
-        Thread-safe: acquires serial lock for entire operation.
+        Thread-safe: uses read thread when running, direct read otherwise.
 
         Returns:
             Dictionary with axis limits: {'X': (min, max), ...}
         """
         # Default limits
-        limits = {
+        default_limits = {
             'X': (0.0, 300.0),
             'Y': (-150.0, 150.0),
             'Z': (0.0, 50.0)
         }
 
-        with self._serial_lock:
-            # Clear any pending data before sending $$
-            if self.serial:
-                self.serial.reset_input_buffer()
+        if self._running:
+            # Use the read thread to handle the query (avoids serial race)
+            self._limits_response = None
+            self._limits_ready.clear()
+            self._limits_request.set()
 
-            # Send $$ to get settings
-            if not self._send_unlocked("$$"):
-                return limits
+            # Wait for response from read thread
+            if self._limits_ready.wait(timeout=6.0):
+                result = self._limits_response if self._limits_response else default_limits
+                self.logger.info(f"Machine limits: {result}")
+                return result
+            else:
+                self.logger.warning("get_limits: Timeout waiting for read thread")
+                return default_limits
+        else:
+            # Direct read when no background thread
+            with self._serial_lock:
+                # Wait for FluidNC to settle after homing
+                time.sleep(0.5)
 
-            # Read settings until 'ok' or timeout
-            start_time = time.time()
-            settings = {}
+                if self.serial:
+                    self.serial.reset_input_buffer()
 
-            while time.time() - start_time < 5.0:  # Increased timeout
-                line = self._readline_unlocked(timeout=0.1)
-                if line:
-                    self.logger.debug(f"get_limits received: {line}")
-                    # Check for end of settings
-                    if line.startswith('ok'):
-                        break
-                    # Parse setting line: $130=300.000
-                    match = re.match(r'\$(\d+)=([\d.-]+)', line)
-                    if match:
-                        setting_num = int(match.group(1))
-                        value = float(match.group(2))
-                        settings[setting_num] = value
+                # Retry mechanism for reliability
+                settings = {}
+                for attempt in range(3):
+                    if not self._send_unlocked("$$"):
+                        time.sleep(0.3)
+                        continue
 
-            if not settings:
-                self.logger.warning("get_limits: No settings received from FluidNC")
+                    start_time = time.time()
 
-        # Extract limits from settings (outside lock - just local data)
-        # $130, $131, $132 = max travel for X, Y, Z
-        if 130 in settings:
-            limits['X'] = (0.0, settings[130])
-        if 131 in settings:
-            limits['Y'] = (0.0, settings[131])
-        if 132 in settings:
-            limits['Z'] = (0.0, settings[132])
+                    while time.time() - start_time < 5.0:
+                        line = self._readline_unlocked(timeout=0.1)
+                        if line:
+                            self.logger.debug(f"get_limits received: {line}")
+                            if line.startswith('ok'):
+                                break
+                            match = re.match(r'\$(\d+)=([\d.-]+)', line)
+                            if match:
+                                setting_num = int(match.group(1))
+                                value = float(match.group(2))
+                                settings[setting_num] = value
 
-        self.logger.info(f"Machine limits: {limits}")
-        return limits
+                    if settings:
+                        break  # Got settings, exit retry loop
+
+                    self.logger.warning(f"get_limits attempt {attempt + 1}/3: No settings received, retrying...")
+                    time.sleep(0.5)
+                    if self.serial:
+                        self.serial.reset_input_buffer()
+
+                if not settings:
+                    self.logger.warning("get_limits: No settings received from FluidNC after 3 attempts")
+
+            # Extract limits from settings
+            limits = dict(default_limits)
+            if 130 in settings:
+                limits['X'] = (0.0, settings[130])
+            if 131 in settings:
+                limits['Y'] = (0.0, settings[131])
+            if 132 in settings:
+                limits['Z'] = (0.0, settings[132])
+
+            self.logger.info(f"Machine limits: {limits}")
+            return limits
+
+    def get_cached_status(self, max_age: float = 0.5) -> Optional[Dict]:
+        """
+        Return the most recent status from auto-report without querying FluidNC.
+
+        This avoids disrupting the serial command/response stream.
+        Returns None if no status has been received or if the cached data is
+        older than max_age seconds.
+
+        Args:
+            max_age: Maximum age in seconds for cached data (default 0.5s)
+
+        Returns:
+            Dictionary with 'state' and 'position' keys, or None
+        """
+        if self._cached_position is None:
+            self._stats['cache_misses'] += 1
+            return None
+
+        age = time.time() - self._cached_position_time
+        if age > max_age:
+            self._stats['cache_misses'] += 1
+            return None
+
+        self._stats['cache_hits'] += 1
+        return {
+            'state': self._cached_state,
+            'position': dict(self._cached_position)
+        }
+
+    def get_stats(self) -> Dict[str, int]:
+        """Return instrumentation counters for debugging."""
+        return dict(self._stats)
 
     def get_status(self) -> Optional[Dict]:
         """
         Query current status and position.
-        Thread-safe: acquires serial lock for entire operation.
+        Thread-safe: uses read thread when running, direct read otherwise.
 
         Returns:
             Dictionary with state and position, or None on error
         """
-        with self._serial_lock:
-            if not self._send_unlocked("?"):
+        self._stats['status_queries_explicit'] += 1
+        if self._running:
+            # Use the read thread to handle the query (avoids serial race)
+            self._status_response = None
+            self._status_ready.clear()
+            self._status_request.set()
+
+            # Wait for response from read thread
+            if self._status_ready.wait(timeout=1.0):
+                return self._status_response
+            else:
+                self.logger.warning("get_status: Timeout waiting for read thread")
                 return None
+        else:
+            # Direct read when no background thread
+            with self._serial_lock:
+                if self.serial:
+                    self.serial.reset_input_buffer()
 
-            # Wait for status response: <Idle|MPos:10.00,20.00,5.00|...>
-            start_time = time.time()
-            while time.time() - start_time < 0.2:  # 200ms is plenty for status response
-                line = self._readline_unlocked(timeout=0.1)
-                if line and line.startswith('<'):
-                    return self._parse_status(line)
+                if not self._send_unlocked("?"):
+                    return None
 
-            return None
+                start_time = time.time()
+                while time.time() - start_time < 0.2:
+                    line = self._readline_unlocked(timeout=0.1)
+                    if line and line.startswith('<'):
+                        return self._parse_status(line)
+
+                return None
 
     def _parse_status(self, status_line: str) -> Optional[Dict]:
         """
         Parse FluidNC status response.
 
-        Example: <Idle|MPos:10.00,20.00,5.00|FS:0,0>
+        Example: <Idle|MPos:10.00,20.00,5.00|Bf:15,120|FS:0,0>
 
         Returns:
-            Dictionary with 'state' and 'position' keys
+            Dictionary with 'state', 'position', and optionally 'buffer' keys
         """
         try:
             # Remove < and >
@@ -465,7 +919,7 @@ class FluidNCHandler:
                 'position': {'X': 0.0, 'Y': 0.0, 'Z': 0.0}
             }
 
-            # Find MPos or WPos
+            # Parse all fields
             for part in parts:
                 if part.startswith('MPos:') or part.startswith('WPos:'):
                     coords = part.split(':')[1].split(',')
@@ -473,6 +927,14 @@ class FluidNCHandler:
                         result['position']['X'] = float(coords[0])
                         result['position']['Y'] = float(coords[1])
                         result['position']['Z'] = float(coords[2])
+                elif part.startswith('Bf:'):
+                    # Buffer status: Bf:planner_blocks,rx_chars_available
+                    bf_values = part.split(':')[1].split(',')
+                    if len(bf_values) >= 2:
+                        result['buffer'] = {
+                            'planner_available': int(bf_values[0]),
+                            'rx_available': int(bf_values[1])
+                        }
 
             return result
 
@@ -493,7 +955,9 @@ class FluidNCHandler:
             True if command sent successfully
         """
         command = f"$J=G90 G21 {axis}{position:.2f} F{feedrate}"
-        return self.send(command)
+        # Use send_gcode with wait_ok=False for proper buffer tracking
+        # without blocking on response (jog needs to be fast)
+        return self.send_gcode(command, wait_ok=False, timeout=1.0)
 
     def cancel_jog(self) -> bool:
         """
@@ -517,7 +981,7 @@ class FluidNCHandler:
 
     def soft_reset(self) -> bool:
         """
-        Send soft reset (Ctrl-X).
+        Send soft reset (Ctrl-X) and clear all pending state.
         Thread-safe.
 
         Returns:
@@ -528,12 +992,18 @@ class FluidNCHandler:
                 if self.serial and self.serial.is_open:
                     self.serial.write(b'\x18')
                     self.logger.info("Soft reset sent")
-                    time.sleep(2.0)  # Wait for reset
+                    time.sleep(0.3)  # Wait for reset (FluidNC resets within ~100ms)
 
-                    # Reset buffer tracking after reset
+                    # Clear all pending commands with reset error
+                    with self._pending_lock:
+                        for pending in self._pending_deque:
+                            pending.response = "error:reset"
+                            pending.response_event.set()
+                        self._pending_deque.clear()
+
+                    # Reset buffer tracking
                     with self._buffer_lock:
                         self._buffer_used = 0
-                        self._pending_commands.clear()
                         self._buffer_space_event.set()
 
                     return True
@@ -561,20 +1031,28 @@ class FluidNCHandler:
                 # Send version query
                 self._send_unlocked("$I")
 
-                # Wait for response
+                # Wait for response - look for version info, consume until 'ok'
                 start_time = time.time()
+                found_fluidnc = False
                 while time.time() - start_time < 2.0:
                     line = self._readline_unlocked(timeout=0.1)
                     if line:
                         self.logger.debug(f"FluidNC ID response: {line}")
 
+                        # 'ok' marks end of $I response
+                        if line.startswith('ok'):
+                            break
+
                         # Look for FluidNC/Grbl version string
                         if '[VER:' in line or '[MSG:' in line or 'Grbl' in line:
-                            return True
+                            found_fluidnc = True
 
                         # Also check for status response
                         if line.startswith('<'):
-                            return True
+                            found_fluidnc = True
+
+                if found_fluidnc:
+                    return True
 
                 # Try status query as alternative
                 self._send_unlocked("?")

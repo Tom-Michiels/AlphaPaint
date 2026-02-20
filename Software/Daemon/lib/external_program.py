@@ -61,13 +61,26 @@ class ExternalProgramHandler:
         # State
         self.process: Optional[subprocess.Popen] = None
         self.current_feedrate = config['machine']['draw_feedrate']
-        self.pen_is_down = False
+        self._pen_is_down = False
+        self._pen_lock = threading.Lock()  # Protects pen_is_down state
         self._running = False
         self._interrupted = False
         self._done_called = False  # True when program calls 'done' API
 
         # Thread for reading program output
         self._read_thread: Optional[threading.Thread] = None
+
+    @property
+    def pen_is_down(self) -> bool:
+        """Thread-safe getter for pen state."""
+        with self._pen_lock:
+            return self._pen_is_down
+
+    @pen_is_down.setter
+    def pen_is_down(self, value: bool):
+        """Thread-safe setter for pen state."""
+        with self._pen_lock:
+            self._pen_is_down = value
 
     def start(self, command: str, args: List[str] = None, timeout: int = 0) -> bool:
         """
@@ -108,6 +121,13 @@ class ExternalProgramHandler:
                 daemon=True
             )
             self._read_thread.start()
+
+            # Start stderr logging thread
+            self._stderr_thread = threading.Thread(
+                target=self._stderr_loop,
+                daemon=True
+            )
+            self._stderr_thread.start()
 
             self.logger.info(f"Started external program: {command}")
             return True
@@ -166,6 +186,19 @@ class ExternalProgramHandler:
         max_z = self.machine_limits['Z'][1]
         self.fluidnc.send_gcode(f"G0 Z{max_z:.2f}", wait_ok=True, timeout=5.0)
         self.pen_is_down = False
+
+    def _stderr_loop(self):
+        """Read and log stderr from external program."""
+        try:
+            while self._running and self.process and self.process.poll() is None:
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+                line = line.rstrip('\n\r')
+                if line:
+                    self.logger.info(f"Program stderr: {line}")
+        except Exception as e:
+            self.logger.error(f"Error reading stderr: {e}")
 
     def _communication_loop(self, timeout: int):
         """
@@ -251,6 +284,7 @@ class ExternalProgramHandler:
             'query_canvas': self._api_query_canvas,
             'query_position': self._api_query_position,
             'pen_up': self._api_pen_up,
+            'pen_up_fast': self._api_pen_up_fast,
             'pen_down': self._api_pen_down,
             'move_to': self._api_move_to,
             'draw_to': self._api_draw_to,
@@ -347,7 +381,18 @@ class ExternalProgramHandler:
         return True, None
 
     def _get_current_position(self) -> Dict[str, float]:
-        """Get current machine position."""
+        """Get current machine position from auto-report cache.
+
+        Uses cached position from auto-report to avoid disrupting the serial
+        command/response stream. Falls back to explicit query only when
+        no cached position exists.
+        """
+        cached = self.fluidnc.get_cached_status(max_age=1.0)
+        if cached and 'position' in cached:
+            return cached['position']
+
+        # Fallback: only happens if auto-report not yet active
+        self.logger.warning("No cached position available, falling back to explicit status query")
         status = self.fluidnc.get_status()
         if status and 'position' in status:
             return status['position']
@@ -426,6 +471,22 @@ class ExternalProgramHandler:
             self.pen_is_down = True
         return {'success': success, 'z': self.pen_z}
 
+    def _api_pen_up_fast(self, params: Dict) -> Dict:
+        """Lift pen 8mm above paper for quick repositioning."""
+        target_z = self.pen_z + 8.0
+        # Clamp to max Z if needed
+        max_z = self.machine_limits['Z'][1]
+        if target_z > max_z:
+            target_z = max_z
+        success = self.fluidnc.send_gcode(
+            f"G0 Z{target_z:.2f}",
+            wait_ok=True,
+            timeout=5.0
+        )
+        if success:
+            self.pen_is_down = False
+        return {'success': success, 'z': target_z}
+
     def _api_move_to(self, params: Dict) -> Dict:
         """Rapid move in machine coordinates."""
         x = params.get('x')
@@ -451,12 +512,14 @@ class ExternalProgramHandler:
 
         success = self.fluidnc.send_gcode(" ".join(cmd_parts), wait_ok=wait)
 
-        if wait:
+        if wait and success:
             pos = self._get_current_position()
             return {
                 'success': success,
                 'position': {'x': pos['X'], 'y': pos['Y'], 'z': pos['Z']}
             }
+        elif wait:
+            return {'success': False}
         else:
             return {'success': success, 'queued': True}
 
@@ -487,12 +550,14 @@ class ExternalProgramHandler:
 
         success = self.fluidnc.send_gcode(" ".join(cmd_parts), wait_ok=wait)
 
-        if wait:
+        if wait and success:
             pos = self._get_current_position()
             return {
                 'success': success,
                 'position': {'x': pos['X'], 'y': pos['Y'], 'z': pos['Z']}
             }
+        elif wait:
+            return {'success': False}
         else:
             return {'success': success, 'queued': True}
 
@@ -519,12 +584,14 @@ class ExternalProgramHandler:
 
         success = self.fluidnc.send_gcode(gcode, wait_ok=wait)
 
-        if wait:
+        if wait and success:
             pos = self._get_current_position()
             return {
                 'success': success,
                 'position': {'x': pos['X'], 'y': pos['Y'], 'z': pos['Z']}
             }
+        elif wait:
+            return {'success': False}
         else:
             return {'success': success, 'queued': True}
 

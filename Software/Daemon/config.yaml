@@ -38,15 +38,15 @@ external_programs:
     timeout: 300              # Maximum runtime in seconds (0 = unlimited)
 
   button_f:
-    enabled: false            # Set to true to use external program instead of ellipse drawing
-    name: "Program 2"
-    command: ""
+    enabled: true
+    name: "Pentest"
+    command: "/home/tom/AlphaPaint/Software/Programs/pentest.py"
     args: []
-    timeout: 300
+    timeout: 0
 
   button_g:
     enabled: true             # Button G only works with external programs
     name: "Ekster"
     command: "/home/tom/AlphaPaint/Software/Programs/ekster.py"
     args: []
-    timeout: 300
+    timeout: 0                # Onbeperkt - tekening kan lang duren

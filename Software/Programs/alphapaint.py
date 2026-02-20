@@ -11,6 +11,14 @@ import json
 import sys
 from typing import Any, Dict, Optional, Tuple
 
+# Toolchanger configuratie
+TOOLCHANGER_FIRST_PEN_X = 700
+TOOLCHANGER_PEN_Y = 12
+TOOLCHANGER_PEN_Z = 13
+TOOLCHANGER_PEN_SPACING = 34
+TOOLCHANGER_Z_MAX = 60
+TOOLCHANGER_Y_SAFE = 55 
+
 
 class AlphaPaintError(Exception):
     """Exception raised when the AlphaPaint API returns an error."""
@@ -135,9 +143,53 @@ class AlphaPaint:
         self._call("pen_down")
         self._pen_is_down = True
 
+    def pen_up_fast(self) -> None:
+        """Lift the pen just 8mm above the paper for quick repositioning."""
+        self._call("pen_up_fast")
+        self._pen_is_down = False
+
     @property
     def pen_is_down(self) -> bool:
         return self._pen_is_down
+
+    # -- Toolchanger ----------------------------------------------------------
+
+    def _get_pen_position(self, pen_index: int) -> Tuple[float, float, float]:
+        """Get X, Y, Z machine coordinates for pen slot (0-indexed)."""
+        x = TOOLCHANGER_FIRST_PEN_X + pen_index * TOOLCHANGER_PEN_SPACING
+        return (x, TOOLCHANGER_PEN_Y, TOOLCHANGER_PEN_Z)
+
+    def pickup_pen(self, pen_index: int) -> None:
+        """Pick up pen from toolchanger slot (0-indexed)."""
+        pen_x, pen_y, pen_z = self._get_pen_position(pen_index)
+
+        # Eerst Y naar veilige hoogte (voorkomt schuine aanrijding)
+        self.move_to_machine(y=pen_y + TOOLCHANGER_Y_SAFE)
+        # Snel naar positie boven pen
+        self.move_to_machine(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=pen_z)
+        # Langzaam Y naar pen (magneet klikt)
+        self.draw_to_machine(y=pen_y, feedrate=4000)
+        # Z omhoog
+        self.move_to_machine(z=TOOLCHANGER_Z_MAX)
+        # Y terug
+        self.move_to_machine(y=pen_y + TOOLCHANGER_Y_SAFE)
+
+    def return_pen(self, pen_index: int) -> None:
+        """Return pen to toolchanger slot (0-indexed)."""
+        pen_x, pen_y, pen_z = self._get_pen_position(pen_index)
+
+        # Snel naar positie boven pen
+        self.move_to_machine(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=TOOLCHANGER_Z_MAX)
+        # Y naar pen positie
+        self.move_to_machine(y=pen_y)
+        # Z naar pen hoogte
+        self.move_to_machine(z=pen_z)
+        # Z naar 0 (loslaten)
+        self.move_to_machine(z=0)
+        # Y terug
+        self.move_to_machine(y=pen_y + TOOLCHANGER_Y_SAFE)
+        # Z omhoog naar pen-hoogte
+        self.move_to_machine(z=pen_z)
 
     # -- Canvas coordinate drawing --------------------------------------------
 

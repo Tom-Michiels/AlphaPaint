@@ -84,6 +84,10 @@ class StateMachine:
     def start(self):
         """Start the state machine."""
         self.logger.info("State machine starting")
+
+        # Reset console to clear any old state (positions, limits, canvas)
+        self.console.reset()
+
         self.transition(self.STATE_NOT_HOMED)
 
     def stop(self):
@@ -249,6 +253,11 @@ class StateMachine:
         max_z = self.machine_limits['Z'][1]
         self.fluidnc.send_gcode(f"G0 Z{max_z:.2f}", wait_ok=True, timeout=5.0)
 
+        # Wait for FluidNC to reach Idle state before proceeding
+        if not self.fluidnc.wait_idle(timeout=5.0):
+            self.logger.warning("FluidNC not idle, sending soft reset")
+            self.fluidnc.soft_reset()
+
         # Stop FluidNC read thread before re-homing
         self.fluidnc.stop()
 
@@ -273,6 +282,10 @@ class StateMachine:
     def _execute_homing(self):
         """Execute homing (runs in background thread)."""
         try:
+            # Clear any stuck state before homing
+            self.fluidnc.soft_reset()
+            time.sleep(0.2)  # Brief pause after reset
+
             # Send home command to FluidNC
             if not self.fluidnc.home():
                 self.logger.error("Homing failed")
@@ -280,8 +293,16 @@ class StateMachine:
                 self._error_blink_all()
                 return
 
-            # Read machine limits
+            # Wait for FluidNC to fully settle after homing
+            time.sleep(0.5)
+
+            # Read machine limits (with retry logic)
             self.machine_limits = self.fluidnc.get_limits()
+
+            # Validate that we got real limits, not defaults
+            default_limits = {'X': (0.0, 300.0), 'Y': (-150.0, 150.0), 'Z': (0.0, 50.0)}
+            if self.machine_limits == default_limits:
+                self.logger.warning("Got default limits - FluidNC may not have responded correctly")
 
             # Get current position
             status = self.fluidnc.get_status()
