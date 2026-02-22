@@ -341,7 +341,13 @@ class FluidNCHandler:
             # Drain and dispatch buffered data (preserves ok responses)
             self._drain_and_dispatch_unlocked()
 
-            if not self._send_unlocked("?"):
+            # Send '?' as raw realtime character — no newline!
+            # In Grbl/FluidNC, '?' is a realtime command processed immediately.
+            # Adding '\n' would be treated as a separate empty-line command,
+            # causing FluidNC to send a spurious 'ok' response.
+            try:
+                self.serial.write(b'?')
+            except Exception:
                 self._status_response = None
                 self._status_ready.set()
                 return
@@ -984,7 +990,10 @@ class FluidNCHandler:
                 if self.serial:
                     self.serial.reset_input_buffer()
 
-                if not self._send_unlocked("?"):
+                # Send '?' as raw realtime character — no newline
+                try:
+                    self.serial.write(b'?')
+                except Exception:
                     return None
 
                 start_time = time.time()
@@ -1153,7 +1162,7 @@ class FluidNCHandler:
                     return True
 
                 # Try status query as alternative
-                self._send_unlocked("?")
+                self.serial.write(b'?')  # Realtime char, no newline
                 time.sleep(0.5)
 
                 while self.serial.in_waiting:
