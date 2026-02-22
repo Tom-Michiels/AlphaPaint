@@ -86,7 +86,10 @@ class FluidNCHandler:
             'command_timeouts': 0,
             'buffer_timeout_leaks_fixed': 0,
             'ok_recovered': 0,
+            'max_buffer_drift': 0,      # Largest single correction by auto-report
         }
+        # Snapshot of stats at last periodic log, for delta reporting
+        self._stats_snapshot: Dict[str, int] = {}
 
     def connect(self) -> bool:
         """
@@ -254,21 +257,61 @@ class FluidNCHandler:
                     last_stale_check = time.time()
                     self._check_stale_commands(STALE_TIMEOUT)
 
-                # Periodic buffer state logging
+                # Periodic health reporting
                 if time.time() - last_buffer_log > BUFFER_LOG_INTERVAL:
                     last_buffer_log = time.time()
-                    with self._buffer_lock:
-                        buffer_used = self._buffer_used
-                    with self._pending_lock:
-                        pending_count = len(self._pending_deque)
-                        pending_cmds = [p.gcode[:20] for p in self._pending_deque]
-                    self.logger.info(f"Buffer state: {buffer_used}/{self._buffer_size} bytes, "
-                                   f"{pending_count} pending: {pending_cmds}")
-                    self.logger.info(f"Stats: {self._stats}")
+                    self._log_periodic_health()
 
             except Exception as e:
                 self.logger.error(f"Error in FluidNC read loop: {e}")
                 time.sleep(0.1)
+
+    def _log_periodic_health(self):
+        """Log periodic health summary with delta reporting."""
+        with self._buffer_lock:
+            buffer_used = self._buffer_used
+        with self._pending_lock:
+            pending_count = len(self._pending_deque)
+            late_ok = self._late_ok_expected
+            pending_cmds = [p.gcode[:20] for p in self._pending_deque]
+
+        # Compute deltas since last report
+        snap = self._stats_snapshot
+        deltas = {}
+        problems = []
+        for key in ('ok_recovered', 'ok_late_discarded', 'ok_orphaned', 'command_timeouts'):
+            cur = self._stats.get(key, 0)
+            prev = snap.get(key, 0)
+            d = cur - prev
+            if d > 0:
+                deltas[key] = d
+
+        if deltas.get('ok_recovered', 0) > 0:
+            problems.append(f"lost_oks={deltas['ok_recovered']}")
+        if deltas.get('command_timeouts', 0) > 0:
+            problems.append(f"timeouts={deltas['command_timeouts']}")
+        if deltas.get('ok_orphaned', 0) > 0:
+            problems.append(f"orphans={deltas['ok_orphaned']}")
+
+        # Save snapshot for next delta
+        self._stats_snapshot = dict(self._stats)
+
+        # Always log buffer state at INFO
+        self.logger.info(
+            f"Buf: {buffer_used}/{self._buffer_size}, "
+            f"{pending_count} pending: {pending_cmds}, "
+            f"late_ok_due={late_ok}")
+
+        # Log problems at WARNING, healthy stats at INFO
+        if problems:
+            self.logger.warning(
+                f"Serial health issues since last report: {', '.join(problems)} "
+                f"(totals: recovered={self._stats['ok_recovered']}, "
+                f"late_discarded={self._stats['ok_late_discarded']}, "
+                f"orphaned={self._stats['ok_orphaned']}, "
+                f"max_drift={self._stats['max_buffer_drift']})")
+        else:
+            self.logger.info(f"Stats: {self._stats}")
 
     def _drain_and_dispatch_unlocked(self):
         """Read and dispatch all currently buffered serial data.
@@ -466,11 +509,23 @@ class FluidNCHandler:
             with self._buffer_lock:
                 old_used = self._buffer_used
                 self._buffer_used = max(0, min(corrected, self._buffer_size))
+                drift = old_used - self._buffer_used  # positive = we were too high
 
-                if old_used != self._buffer_used:
-                    self.logger.debug(
-                        f"Buffer sync: {old_used} -> {self._buffer_used} "
-                        f"(real={real_buffer_used}, grace={grace_bytes})")
+                if drift != 0:
+                    abs_drift = abs(drift)
+                    if abs_drift > self._stats['max_buffer_drift']:
+                        self._stats['max_buffer_drift'] = abs_drift
+                    # Large drift = ok responses were lost/delayed since
+                    # last auto-report. This is the key early-warning signal.
+                    if abs_drift > 20:
+                        self.logger.warning(
+                            f"Buffer drift {old_used} -> {self._buffer_used} "
+                            f"(real={real_buffer_used}, grace={grace_bytes}, "
+                            f"drift={drift})")
+                    else:
+                        self.logger.debug(
+                            f"Buffer sync: {old_used} -> {self._buffer_used} "
+                            f"(real={real_buffer_used}, grace={grace_bytes})")
 
                 if self._buffer_used < self._buffer_size - 50:
                     self._buffer_space_event.set()
