@@ -229,7 +229,7 @@ class FluidNCHandler:
         last_buffer_log = time.time()
         STALE_CHECK_INTERVAL = 5.0  # Check every 5 seconds
         STALE_TIMEOUT = 30.0  # Commands older than 30 seconds are stale
-        BUFFER_LOG_INTERVAL = 2.0  # Log buffer state every 2 seconds
+        BUFFER_LOG_INTERVAL = 10.0  # Log buffer state every 10 seconds
 
         while self._running:
             try:
@@ -296,22 +296,19 @@ class FluidNCHandler:
         # Save snapshot for next delta
         self._stats_snapshot = dict(self._stats)
 
-        # Always log buffer state at INFO
-        self.logger.info(
-            f"Buf: {buffer_used}/{self._buffer_size}, "
-            f"{pending_count} pending: {pending_cmds}, "
-            f"late_ok_due={late_ok}")
-
-        # Log problems at WARNING, healthy stats at INFO
+        # Log problems at WARNING, otherwise only when active
         if problems:
             self.logger.warning(
-                f"Serial health issues since last report: {', '.join(problems)} "
-                f"(totals: recovered={self._stats['ok_recovered']}, "
+                f"Serial health: {', '.join(problems)} "
+                f"(buf={buffer_used}/{self._buffer_size}, "
+                f"pending={pending_count}, late_ok_due={late_ok}, "
+                f"totals: recovered={self._stats['ok_recovered']}, "
                 f"late_discarded={self._stats['ok_late_discarded']}, "
-                f"orphaned={self._stats['ok_orphaned']}, "
-                f"max_drift={self._stats['max_buffer_drift']})")
-        else:
-            self.logger.info(f"Stats: {self._stats}")
+                f"orphaned={self._stats['ok_orphaned']})")
+        elif pending_count > 0 or buffer_used > 0:
+            self.logger.info(
+                f"Buf: {buffer_used}/{self._buffer_size}, "
+                f"{pending_count} pending, late_ok_due={late_ok}")
 
     def _drain_and_dispatch_unlocked(self):
         """Read and dispatch all currently buffered serial data.
@@ -515,17 +512,9 @@ class FluidNCHandler:
                     abs_drift = abs(drift)
                     if abs_drift > self._stats['max_buffer_drift']:
                         self._stats['max_buffer_drift'] = abs_drift
-                    # Large drift = ok responses were lost/delayed since
-                    # last auto-report. This is the key early-warning signal.
-                    if abs_drift > 20:
-                        self.logger.warning(
-                            f"Buffer drift {old_used} -> {self._buffer_used} "
-                            f"(real={real_buffer_used}, grace={grace_bytes}, "
-                            f"drift={drift})")
-                    else:
-                        self.logger.debug(
-                            f"Buffer sync: {old_used} -> {self._buffer_used} "
-                            f"(real={real_buffer_used}, grace={grace_bytes})")
+                    self.logger.debug(
+                        f"Buffer sync: {old_used} -> {self._buffer_used} "
+                        f"(real={real_buffer_used}, grace={grace_bytes})")
 
                 if self._buffer_used < self._buffer_size - 50:
                     self._buffer_space_event.set()
@@ -535,12 +524,18 @@ class FluidNCHandler:
             # Recover lost "ok" responses.
             #
             # In Grbl/FluidNC, "ok" means "I parsed this command into
-            # my planner" — NOT "motion complete". Parsing is near-instant,
-            # so "ok" should arrive within ~100ms of sending. If FluidNC's
-            # RX buffer is completely empty but we have pending commands
-            # older than 1s, their "ok" was lost on the serial line.
-            LOST_OK_THRESHOLD = 1.0
-            if rx_available >= self._buffer_size:
+            # my planner" — NOT "motion complete". If the planner buffer
+            # is full (planner_available == 0), FluidNC delays the "ok"
+            # until a planner slot opens — this is NORMAL and not a lost ok.
+            #
+            # We only recover when BOTH conditions are met:
+            #   1. RX buffer is empty (command was read from serial)
+            #   2. Planner has free slots (no reason for ok to be delayed)
+            # If both are true and we still haven't received ok after 5s,
+            # it was genuinely lost on the serial line.
+            planner_available = buffer_info.get('planner_available', 0)
+            LOST_OK_THRESHOLD = 5.0
+            if rx_available >= self._buffer_size and planner_available > 0:
                 while self._pending_deque:
                     oldest = self._pending_deque[0]
                     if oldest.sent_timestamp <= 0:
@@ -550,7 +545,8 @@ class FluidNCHandler:
                         stale = self._pending_deque.popleft()
                         self.logger.warning(
                             f"Recovering lost 'ok' for '{stale.gcode}' "
-                            f"(age={age:.1f}s since send, FluidNC buffer empty)")
+                            f"(age={age:.1f}s since send, FluidNC buffer empty, "
+                            f"planner={planner_available})")
                         stale.response = 'ok'
                         stale.response_event.set()
                         self._stats['ok_recovered'] += 1
