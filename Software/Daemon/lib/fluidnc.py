@@ -718,32 +718,48 @@ class FluidNCHandler:
         if not wait_ok:
             return True
 
-        # Wait for response on this specific command
+        # Wait for response on this specific command.
+        #
+        # FluidNC delays "ok" while the planner is full — this is normal
+        # for arc commands that decompose into many short segments.
+        # We only time out if the machine is idle (nothing to process)
+        # and we STILL haven't received ok.
         if self._running:
-            # Background thread will deliver response via pending.response_event
-            if pending.response_event.wait(timeout=timeout):
-                response = pending.response
-                if response and response.startswith('ok'):
-                    return True
-                elif response and response.startswith('error:'):
-                    self.logger.error(f"FluidNC error: {response}")
-                    return False
-                else:
-                    self.logger.error(f"Unexpected response to {gcode}: {response}")
-                    return False
-            else:
-                self.logger.error(f"Timeout waiting for response to: {gcode}")
-                self._stats['command_timeouts'] += 1
-                # Remove from pending and expect a late ok.
-                # If we leave it, the next command's ok gets delivered to
-                # this stale entry (FIFO), cascading into complete desync.
-                with self._pending_lock:
-                    try:
-                        self._pending_deque.remove(pending)
-                        self._late_ok_expected += 1
-                    except ValueError:
-                        pass  # Already removed by recovery
-                return False
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                if pending.response_event.wait(timeout=min(remaining, 0.5)):
+                    # Got a response
+                    response = pending.response
+                    if response and response.startswith('ok'):
+                        return True
+                    elif response and response.startswith('error:'):
+                        self.logger.error(f"FluidNC error: {response}")
+                        return False
+                    else:
+                        self.logger.error(f"Unexpected response to {gcode}: {response}")
+                        return False
+
+                # No response yet — if machine is actively running,
+                # the ok is legitimately delayed (planner processing).
+                # Reset deadline to avoid timing out during normal work.
+                if self._cached_state == 'Run':
+                    deadline = time.time() + timeout
+
+            self.logger.error(f"Timeout waiting for response to: {gcode}")
+            self._stats['command_timeouts'] += 1
+            # Remove from pending and expect a late ok.
+            # If we leave it, the next command's ok gets delivered to
+            # this stale entry (FIFO), cascading into complete desync.
+            with self._pending_lock:
+                try:
+                    self._pending_deque.remove(pending)
+                    self._late_ok_expected += 1
+                except ValueError:
+                    pass  # Already removed by recovery
+            return False
         else:
             # No background thread - read directly (no flow control)
             # Remove from pending deque since we're handling response directly
