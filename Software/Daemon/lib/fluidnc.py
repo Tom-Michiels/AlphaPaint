@@ -273,7 +273,12 @@ class FluidNCHandler:
         with self._pending_lock:
             pending_count = len(self._pending_deque)
             late_ok = self._late_ok_expected
-            pending_cmds = [p.gcode[:20] for p in self._pending_deque]
+            now_health = time.time()
+            pending_info = [
+                f"{p.gcode[:20]}({now_health - p.sent_timestamp:.1f}s)"
+                if p.sent_timestamp > 0 else p.gcode[:20]
+                for p in self._pending_deque
+            ]
 
         # Compute deltas since last report
         snap = self._stats_snapshot
@@ -301,14 +306,14 @@ class FluidNCHandler:
             self.logger.warning(
                 f"Serial health: {', '.join(problems)} "
                 f"(buf={buffer_used}/{self._buffer_size}, "
-                f"pending={pending_count}, late_ok_due={late_ok}, "
+                f"pending={pending_count}: {pending_info}, late_ok_due={late_ok}, "
                 f"totals: recovered={self._stats['ok_recovered']}, "
                 f"late_discarded={self._stats['ok_late_discarded']}, "
                 f"orphaned={self._stats['ok_orphaned']})")
         elif pending_count > 0 or buffer_used > 0:
             self.logger.info(
                 f"Buf: {buffer_used}/{self._buffer_size}, "
-                f"{pending_count} pending, late_ok_due={late_ok}")
+                f"{pending_count} pending: {pending_info}, late_ok_due={late_ok}")
 
     def _drain_and_dispatch_unlocked(self):
         """Read and dispatch all currently buffered serial data.
@@ -729,11 +734,15 @@ class FluidNCHandler:
             else:
                 self.logger.error(f"Timeout waiting for response to: {gcode}")
                 self._stats['command_timeouts'] += 1
-                # Do NOT remove from pending - leave it for the late "ok".
-                # Removing it causes a FIFO shift where the late "ok" matches
-                # the NEXT command, cascading into complete desync.
-                # The lost-ok recovery in _sync_buffer_from_status() will
-                # clean up if the "ok" was truly lost.
+                # Remove from pending and expect a late ok.
+                # If we leave it, the next command's ok gets delivered to
+                # this stale entry (FIFO), cascading into complete desync.
+                with self._pending_lock:
+                    try:
+                        self._pending_deque.remove(pending)
+                        self._late_ok_expected += 1
+                    except ValueError:
+                        pass  # Already removed by recovery
                 return False
         else:
             # No background thread - read directly (no flow control)
