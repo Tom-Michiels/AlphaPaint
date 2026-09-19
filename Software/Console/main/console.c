@@ -1,5 +1,5 @@
 /*
- * AlphaPaint Console Firmware v1.1
+ * AlphaPaint Console Firmware v1.2
  *
  * Production firmware implementing the full specification:
  * - Homing state management (NOT_HOMED/HOMED)
@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -83,7 +84,9 @@ static const char *TAG = "CONSOLE";
 #define LED_BLINK_MS              500  // Slow blink for BLINK mode (was 300ms)
 #define NOT_HOMED_BLINK_MS        300
 #define POSITION_UPDATE_RATE_MS   50   // Rate limit for UART position updates
-#define MAIN_LOOP_DELAY_MS        1    // Minimal delay - just yield to RTOS scheduler
+#define MAIN_LOOP_TICKS           1    // One RTOS tick (10 ms at 100 Hz); lets the idle task run
+#define BUTTON_DEBOUNCE_MS        30   // Button level must be stable this long
+#define PCNT_RECENTER_LIMIT       16000 // Re-center the encoder counter well before +-32767
 #define ENCODER_COUNTS_PER_CLICK  4
 #define NORMAL_INCREMENT          100
 #define PRECISION_INCREMENT       1
@@ -145,7 +148,9 @@ static int pending_position_axis = 0;
 // Button state tracking
 typedef struct {
     int pin;
-    int last_state;
+    int last_state;            // Debounced level
+    int last_raw;              // Raw level at the previous poll
+    uint32_t raw_change_time;  // When the raw level last changed
     uint32_t press_time;
     bool long_press_triggered;
 } button_state_t;
@@ -406,6 +411,8 @@ void init_buttons(void) {
     for (int i = 0; i < 10; i++) {
         buttons[i].pin = button_pins[i];
         buttons[i].last_state = gpio_get_level(button_pins[i]);
+        buttons[i].last_raw = buttons[i].last_state;
+        buttons[i].raw_change_time = 0;
         buttons[i].press_time = 0;
         buttons[i].long_press_triggered = false;
     }
@@ -530,9 +537,23 @@ void uart_send_axis_event(const char *axis, const char *event) {
     ESP_LOGI(TAG, "TX: %s", buf);
 }
 
+// Format a value stored as hundredths. Keeps the sign for -0.99..-0.01,
+// which "%d.%02d" of value/100 would lose.
+static void format_centi(char *buf, size_t len, int32_t value) {
+    int32_t a = value < 0 ? -value : value;
+    snprintf(buf, len, "%s%d.%02d", value < 0 ? "-" : "", (int)(a / 100), (int)(a % 100));
+}
+
+// Parse "123.45" into hundredths, rounding instead of truncating
+static int32_t parse_centi(const char *str) {
+    return (int32_t)lroundf(atof(str) * 100.0f);
+}
+
 void uart_send_position(const char *axis, int32_t value) {
+    char num[16];
     char buf[32];
-    snprintf(buf, sizeof(buf), "POS:%s:%d.%02d", axis, (int)(value / 100), (int)(abs(value) % 100));
+    format_centi(num, sizeof(num), value);
+    snprintf(buf, sizeof(buf), "POS:%s:%s", axis, num);
     uart_send_string(buf);
 }
 
@@ -551,10 +572,11 @@ void uart_send_error(const char *error) {
 }
 
 void uart_send_limit_response(const char *axis, int32_t min, int32_t max) {
+    char min_str[16], max_str[16];
     char buf[64];
-    snprintf(buf, sizeof(buf), "LIMIT:%s:%d.%02d:%d.%02d",
-             axis, (int)(min / 100), (int)(abs(min) % 100),
-             (int)(max / 100), (int)(abs(max) % 100));
+    format_centi(min_str, sizeof(min_str), min);
+    format_centi(max_str, sizeof(max_str), max);
+    snprintf(buf, sizeof(buf), "LIMIT:%s:%s:%s", axis, min_str, max_str);
     uart_send_string(buf);
     ESP_LOGI(TAG, "TX: %s", buf);
 }
@@ -579,8 +601,12 @@ void process_uart_command(const char *cmd) {
         return;
     }
 
+    // Identification query from the Pi
+    if (strcmp(token, "ID?") == 0) {
+        uart_send_string("CONSOLE:ALPHAPAINT:V1.2");
+    }
     // MODE command
-    if (strcmp(token, "MODE") == 0) {
+    else if (strcmp(token, "MODE") == 0) {
         token = strtok(NULL, ":");
         if (token == NULL) {
             uart_send_error("INVALID_CMD:MODE");
@@ -614,8 +640,7 @@ void process_uart_command(const char *cmd) {
         }
 
         // Parse value (format: 123.45 or -123.45)
-        float value_float = atof(value_str);
-        int32_t value = (int32_t)(value_float * 100);
+        int32_t value = parse_centi(value_str);
 
         // Determine which axis
         int axis_index = -1;
@@ -636,7 +661,7 @@ void process_uart_command(const char *cmd) {
 
         axis_positions[axis_index] = value;
         update_display(axis_index);  // Update display when position changes
-        ESP_LOGI(TAG, "Position %s set to %d.%02d", axis_str, (int)(value / 100), (int)(abs(value) % 100));
+        ESP_LOGD(TAG, "Position %s set to %ld", axis_str, (long)value);
     }
     // LED command
     else if (strcmp(token, "LED") == 0) {
@@ -709,10 +734,8 @@ void process_uart_command(const char *cmd) {
             return;
         }
 
-        float min_float = atof(min_str);
-        float max_float = atof(max_str);
-        int32_t min_val = (int32_t)(min_float * 100);
-        int32_t max_val = (int32_t)(max_float * 100);
+        int32_t min_val = parse_centi(min_str);
+        int32_t max_val = parse_centi(max_str);
 
         // Validate
         if (min_val > max_val) {
@@ -724,9 +747,7 @@ void process_uart_command(const char *cmd) {
         axis_limits_max[axis_index] = max_val;
 
         const char *axis_name = (axis_index == 0) ? "X" : (axis_index == 1) ? "Y" : "Z";
-        ESP_LOGI(TAG, "Limits %s set to %d.%02d : %d.%02d",
-                 axis_name, (int)(min_val / 100), (int)(abs(min_val) % 100),
-                 (int)(max_val / 100), (int)(abs(max_val) % 100));
+        ESP_LOGD(TAG, "Limits %s set to %ld : %ld", axis_name, (long)min_val, (long)max_val);
     }
     else {
         uart_send_error("UNKNOWN_CMD");
@@ -843,13 +864,25 @@ void update_axis_leds(void) {
 // ============================================================================
 
 void update_encoder(void) {
-    // Only process encoder in ACTIVE mode and HOMED state
-    if (operating_mode != MODE_ACTIVE || homing_state != HOMING_STATE_HOMED) {
-        return;
-    }
-
     int16_t pcnt_value;
     ESP_ERROR_CHECK(pcnt_get_counter_value(PCNT_UNIT, &pcnt_value));
+
+    // Keep the hardware counter away from its limits: PCNT jumps back to 0
+    // at +-32767, which looked like a huge turn and jogged to an axis limit.
+    if (pcnt_value > PCNT_RECENTER_LIMIT || pcnt_value < -PCNT_RECENTER_LIMIT) {
+        int remainder = pcnt_value - last_pcnt_value;  // not yet consumed counts
+        pcnt_counter_clear(PCNT_UNIT);
+        pcnt_value = 0;
+        last_pcnt_value = -remainder;
+    }
+
+    // Only process encoder in ACTIVE mode and HOMED state. Otherwise discard
+    // the turns: they used to pile up and were applied all at once when
+    // ACTIVE mode started, jogging the machine by surprise.
+    if (operating_mode != MODE_ACTIVE || homing_state != HOMING_STATE_HOMED) {
+        last_pcnt_value = pcnt_value;
+        return;
+    }
 
     int delta = (pcnt_value - last_pcnt_value) / ENCODER_COUNTS_PER_CLICK;
 
@@ -952,7 +985,19 @@ void poll_buttons(void) {
     uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     for (int i = 0; i < 10; i++) {
-        int state = gpio_get_level(buttons[i].pin);
+        // Debounce: a contact bounce used to register a short press on the
+        // way down, turning one long press on A into SHORT + LONG (two
+        // concurrent homing requests on the Pi).
+        int raw = gpio_get_level(buttons[i].pin);
+        if (raw != buttons[i].last_raw) {
+            buttons[i].last_raw = raw;
+            buttons[i].raw_change_time = current_time;
+        }
+        int state = buttons[i].last_state;
+        if (raw != buttons[i].last_state &&
+            (current_time - buttons[i].raw_change_time) >= BUTTON_DEBOUNCE_MS) {
+            state = raw;
+        }
 
         // Button pressed (HIGH → LOW)
         if (state == 0 && buttons[i].last_state == 1) {
@@ -984,7 +1029,7 @@ void poll_buttons(void) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "AlphaPaint Console Firmware v1.1");
+    ESP_LOGI(TAG, "AlphaPaint Console Firmware v1.2");
     ESP_LOGI(TAG, "========================================");
 
     // Initialize hardware
@@ -1007,7 +1052,7 @@ void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send identification
-    uart_send_string("CONSOLE:ALPHAPAINT:V1.1");
+    uart_send_string("CONSOLE:ALPHAPAINT:V1.2");
     uart_send_status("NOT_HOMED");
 
     // Initialize displays to show dashes (NOT_HOMED state)
@@ -1016,6 +1061,10 @@ void app_main(void) {
     ESP_LOGI(TAG, "Initialization complete");
     ESP_LOGI(TAG, "State: NOT_HOMED, Mode: PASSIVE");
     ESP_LOGI(TAG, "Waiting for homing from Raspberry Pi...");
+
+    // From here on only warnings: ESP_LOG writes bypass the UART driver and
+    // could land in the middle of a protocol message on the same UART.
+    esp_log_level_set("*", ESP_LOG_WARN);
 
     // Main loop
     while (1) {
@@ -1064,6 +1113,6 @@ void app_main(void) {
         check_uart_rx();
 
         // Main loop delay
-        vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_DELAY_MS));
+        vTaskDelay(MAIN_LOOP_TICKS);
     }
 }
