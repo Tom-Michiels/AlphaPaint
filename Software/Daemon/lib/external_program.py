@@ -725,61 +725,75 @@ class ExternalProgramHandler:
         mx, my = self._normalized_to_machine(x, y)
         return self._api_draw_to({'x': mx, 'y': my, 'feedrate': feedrate, 'wait': wait})
 
-    def _api_rehome_y(self, params: Dict) -> Dict:
-        """Re-home the Y axis to wipe out any accumulated Y offset.
+    def _home_axis_and_measure(self, axis: str) -> Optional[float]:
+        """Home one axis and return how far the machine had drifted.
 
-        The pen goes up and the gantry moves to the X position where the
-        full homing cycle also homes Y (known to be free of obstacles such as
-        the pen changer), then FluidNC runs a Y-only homing cycle.
+        While homing, MPos keeps counting down in the old coordinate system,
+        so the lowest value reached is where the switch actually tripped.
+        Negative means the machine had to travel further than FluidNC
+        expected (it sat further from the switch than believed). Resolution
+        is one status report, a few mm.
+        """
+        samples = []
+        done = threading.Event()
+
+        def sample():
+            while not done.is_set():
+                status = self.fluidnc.get_cached_status(max_age=0.5)
+                if status and status.get('state') in ('Home', 'Homing'):
+                    samples.append(status['position'][axis])
+                time.sleep(0.03)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
+        try:
+            homed = self.fluidnc.send_gcode(f"$H{axis}", wait_ok=True, timeout=90.0)
+        finally:
+            done.set()
+            sampler.join(timeout=1.0)
+        if not homed:
+            raise RuntimeError(f"{axis} re-homing failed")
+        return min(samples) if samples else None
+
+    def _api_rehome_y(self, params: Dict) -> Dict:
+        """Re-home X and Y to wipe out any accumulated offset, and measure it.
+
+        The pen goes up and the gantry moves left of the pen holder first.
+        X is homed before Y, the same order the full homing cycle uses.
+        Measuring both axes separates the causes: on CoreXY a single motor
+        (or its pulley) slipping shows up as an equal offset in X and Y,
+        while an equal offset in Y only means both belts moved.
         """
         machine_cfg = self.config.get('machine', {})
         safe_x = float(machine_cfg.get('rehome_safe_x', 0.0))
-        home_y = float((machine_cfg.get('home_position') or {}).get('Y', 0.0))
+        home = machine_cfg.get('home_position') or {}
+        home_x = float(home.get('X', 0.0))
+        home_y = float(home.get('Y', 0.0))
 
         self._api_pen_up({})
         self._send_motion(f"G0 X{safe_x:.3f}", wait=True)
-        # Wait until the move has really finished before homing
         self._send_motion("G4 P0", wait=True)
         before = self._get_current_position(fresh=True)
 
-        # While homing, MPos keeps counting down in the old coordinate system.
-        # The lowest value reached is where the switch actually tripped, so it
-        # is how far the machine had drifted (positive = it sat lower than
-        # FluidNC thought). Resolution is one status report, a few mm.
-        drift_samples = []
+        drift_x = self._home_axis_and_measure('X')
+        drift_y = self._home_axis_and_measure('Y')
 
-        def sample_during_homing():
-            while not homing_done.is_set():
-                status = self.fluidnc.get_cached_status(max_age=0.5)
-                if status and status.get('state') in ('Home', 'Homing'):
-                    drift_samples.append(status['position']['Y'])
-                time.sleep(0.03)
-
-        homing_done = threading.Event()
-        sampler = threading.Thread(target=sample_during_homing, daemon=True)
-        sampler.start()
-        try:
-            homed = self.fluidnc.send_gcode("$HY", wait_ok=True, timeout=90.0)
-        finally:
-            homing_done.set()
-            sampler.join(timeout=1.0)
-        if not homed:
-            raise RuntimeError("Y re-homing failed")
-        drift = min(drift_samples) if drift_samples else None
         self.fluidnc.send_gcode("G4 P0", wait_ok=True, timeout=10.0)
         status = self.fluidnc.get_status()
         if (not status or status['state'] != 'Idle'
+                or abs(status['position']['X'] - home_x) > 0.5
                 or abs(status['position']['Y'] - home_y) > 0.5):
-            raise RuntimeError(f"Y re-homing not verified (status={status})")
-        if drift is None:
-            self.logger.info(f"Y re-homed (Y was {before['Y']:.3f} before re-homing)")
-        else:
-            self.logger.info(f"Y re-homed: drift {drift:+.1f}mm "
-                             f"(switch tripped at Y={drift:.1f} instead of 0; "
-                             f"Y was {before['Y']:.3f} before re-homing)")
-        return {'success': True, 'drift_mm': drift, 'position': {
-            'x': status['position']['X'], 'y': status['position']['Y'],
-            'z': status['position']['Z']}}
+            raise RuntimeError(f"Re-homing not verified (status={status})")
+
+        def fmt(v):
+            return f"{v:+.1f}mm" if v is not None else "?"
+
+        self.logger.info(f"Re-homed: drift X {fmt(drift_x)}, Y {fmt(drift_y)} "
+                         f"(was at X={before['X']:.1f} Y={before['Y']:.1f})")
+        return {'success': True, 'drift_mm': drift_y,
+                'drift_x_mm': drift_x, 'drift_y_mm': drift_y,
+                'position': {'x': status['position']['X'], 'y': status['position']['Y'],
+                             'z': status['position']['Z']}}
 
     def _api_set_feedrate(self, params: Dict) -> Dict:
         """Set default drawing feedrate."""
