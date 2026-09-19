@@ -19,9 +19,14 @@ TOOLCHANGER_PEN_SPACING = 34
 TOOLCHANGER_Z_MAX = 60
 TOOLCHANGER_Y_SAFE = 55 
 
-# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Wist een eventuele
-# Y-verschuiving voordat ze kan oplopen tot een botsing aan de onderkant.
-REHOME_Y_EVERY_N_PEN_CHANGES = 1
+# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Staat uit: homen
+# beweegt Y naar 0 en het is niet geverifieerd dat dat vrij is van de
+# penhouder. Zet op 1 zodra dat wel zeker is.
+REHOME_Y_EVERY_N_PEN_CHANGES = 0
+
+# Maximale afwijking (mm) tussen de gevraagde en de werkelijke positie
+# voordat de kop de penhouder in beweegt.
+TOOLCHANGER_POSITION_TOLERANCE = 0.5
 
 
 class AlphaPaintError(Exception):
@@ -169,6 +174,25 @@ class AlphaPaint:
         self._call("rehome_y")
         self._pen_is_down = False
 
+    def _verify_position(self, x: Optional[float] = None, y: Optional[float] = None,
+                         z: Optional[float] = None) -> None:
+        """Controleer waar de machine echt staat voor een risicovolle beweging.
+
+        Een overgeslagen of geweigerde beweging zou de kop anders bij de
+        verkeerde X de penhouder in sturen.
+        """
+        # flush() keert pas terug als alles uitgevoerd is: een "ok" betekent
+        # alleen dat FluidNC de beweging ingepland heeft.
+        pos = self._call("flush")["position"]
+        for axis, expected in (("x", x), ("y", y), ("z", z)):
+            if expected is None:
+                continue
+            actual = pos[axis]
+            if abs(actual - expected) > TOOLCHANGER_POSITION_TOLERANCE:
+                raise AlphaPaintError(
+                    f"Machine staat op {axis.upper()}={actual:.2f} in plaats van "
+                    f"{expected:.2f} - penwissel afgebroken om een botsing te voorkomen")
+
     def pickup_pen(self, pen_index: int) -> None:
         """Pick up pen from toolchanger slot (0-indexed)."""
         if REHOME_Y_EVERY_N_PEN_CHANGES and self._pen_changes % REHOME_Y_EVERY_N_PEN_CHANGES == 0:
@@ -182,6 +206,8 @@ class AlphaPaint:
         self.move_to_machine(y=pen_y + TOOLCHANGER_Y_SAFE)
         # Snel naar positie boven pen
         self.move_to_machine(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=pen_z)
+        # Pas insteken als de kop echt voor het juiste slot staat
+        self._verify_position(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=pen_z)
         # Langzaam Y naar pen (magneet klikt)
         self.draw_to_machine(y=pen_y, feedrate=4000)
         # Z omhoog
@@ -195,6 +221,8 @@ class AlphaPaint:
 
         # Snel naar positie boven pen
         self.move_to_machine(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=TOOLCHANGER_Z_MAX)
+        # Pas insteken als de kop echt voor het juiste slot staat
+        self._verify_position(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=TOOLCHANGER_Z_MAX)
         # Langzaam Y naar pen positie (voorkomt stappenverlies)
         self.draw_to_machine(y=pen_y, feedrate=4000)
         # Langzaam Z naar pen hoogte
