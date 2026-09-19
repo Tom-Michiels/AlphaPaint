@@ -10,6 +10,12 @@ machine:
   jog_feedrate: 10000       # Jog speed (mm/min)
   draw_feedrate: 3000       # Drawing speed (mm/min)
   pen_lift_feedrate: 10000  # Pen Z movement speed (mm/min)
+  # Machine position right after homing (FluidNC homing mpos_mm). Homing is
+  # rejected if FluidNC does not report this position afterwards.
+  home_position: {X: 0.0, Y: 0.0, Z: 60.0}
+  # X position where Y is re-homed during programs (rehome_y). Must be free of
+  # obstacles along Y down to the Y switch - the full homing uses X=0.
+  rehome_safe_x: 0.0
   # Note: Safe Z height is dynamically read from machine_limits['Z'][1]
 
 # Override FluidNC axis limits at every daemon start (sent via $ commands).

@@ -275,8 +275,11 @@ class ConsoleHandler:
         """
         # Skip ESP-IDF log messages (contain ANSI codes or start with log level indicators)
         # These look like: [0;32mI (12345) TAG: message
-        if message.startswith('[0;') or message.startswith('\x1b['):
-            return  # Skip ANSI-colored ESP-IDF log output
+        if message.startswith('[0;') or '\x1b' in message:
+            # ANSI-colored ESP-IDF log output. Older console firmware could
+            # also mix a log line into the middle of a protocol message; such
+            # a line is garbage and must not be half-parsed.
+            return
 
         parts = message.split(':')
         if len(parts) < 2:

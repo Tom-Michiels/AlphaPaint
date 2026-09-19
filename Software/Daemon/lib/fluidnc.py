@@ -50,6 +50,20 @@ class FluidNCHandler:
         self._read_thread: Optional[threading.Thread] = None
         self._running = False
         self._status_callback: Optional[Callable[[Dict], None]] = None
+        # Called with the alarm text when FluidNC reports an alarm
+        self._alarm_callback: Optional[Callable[[str], None]] = None
+        # Called when FluidNC restarted without us asking for it (reboot,
+        # brown-out, external reset): its position is then unknown.
+        self._reset_callback: Optional[Callable[[], None]] = None
+        # Called when the serial port stops working (USB disconnect)
+        self._disconnect_callback: Optional[Callable[[], None]] = None
+        # Banner lines seen before this time are the result of our own Ctrl-X
+        self._expect_reset_until = 0.0
+        self._consecutive_read_errors = 0
+
+        # Serializes "check buffer space + send" so two threads (console jogs,
+        # external program) cannot both claim the same free buffer space.
+        self._send_lock = threading.Lock()
 
         # Per-command response tracking (replaces shared queue)
         self._pending_lock = threading.Lock()
@@ -79,6 +93,7 @@ class FluidNCHandler:
         self._cached_position: Optional[Dict[str, float]] = None
         self._cached_position_time: float = 0.0
         self._cached_state: Optional[str] = None
+        self._cached_substate: Optional[str] = None
 
         # Instrumentation counters
         self._stats = {
@@ -97,9 +112,13 @@ class FluidNCHandler:
         # Snapshot of stats at last periodic log, for delta reporting
         self._stats_snapshot: Dict[str, int] = {}
 
-    def connect(self) -> bool:
+    def connect(self, reset: bool = True) -> bool:
         """
         Connect to FluidNC serial port.
+
+        Args:
+            reset: Put FluidNC in a clean state (stop motion, soft reset,
+                   auto-report off). Use False for a non-intrusive probe.
 
         Returns:
             True if connection successful, False otherwise
@@ -112,19 +131,23 @@ class FluidNCHandler:
             )
             time.sleep(2.0)  # Wait for FluidNC to initialize
             self.logger.info(f"Connected to FluidNC on {self.port}")
+            if not reset:
+                return True
 
-            # Full reset sequence to clear any stuck state
+            # If a previous daemon instance died mid-drawing the machine may
+            # still be moving. A Ctrl-X during motion loses position, so bring
+            # it to a controlled stop first.
+            self._hold_if_moving_unlocked()
+
+            self._expect_reset_until = time.time() + 5.0
             self.serial.write(b'\x18')  # Ctrl-X soft reset
             self.tracer.note_soft_reset()
             self.logger.info("Soft reset sent to clear any stuck state")
             time.sleep(2.0)  # Wait for reset to complete
             self.serial.reset_input_buffer()  # Clear startup messages
 
-            # Unlock if in ALARM state (e.g. after previous crash)
-            self.serial.write(b'$X\n')
-            time.sleep(0.5)
-            self.serial.reset_input_buffer()
-            self.logger.info("Alarm unlock ($X) sent")
+            # Deliberately NO $X here: an alarm after reset means FluidNC does
+            # not know where the machine is. Only a homing cycle may clear it.
 
             # Disable auto-report to prevent flooding
             self.serial.write(b'$Report/Interval=0\n')
@@ -135,6 +158,47 @@ class FluidNCHandler:
         except Exception as e:
             self.logger.error(f"Failed to connect to FluidNC: {e}")
             return False
+
+    def _query_state_unlocked(self, timeout: float = 0.5) -> Optional[Dict]:
+        """Send '?' and return the parsed status (read thread must not run)."""
+        try:
+            self.serial.write(b'?')
+        except Exception:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = self._readline_unlocked(timeout=0.1)
+            if line and line.startswith('<'):
+                return self._parse_status(line)
+        return None
+
+    def _hold_if_moving_unlocked(self, timeout: float = 5.0) -> bool:
+        """Feed-hold and wait for standstill if FluidNC is moving.
+
+        Only for use while the read thread is not running. Returns True when
+        the machine is (now) at a standstill.
+        """
+        status = self._query_state_unlocked()
+        if not status or status['state'] not in ('Run', 'Jog', 'Hold'):
+            return True
+        self.logger.warning(f"FluidNC is moving ({status['state']}) - feed hold before reset")
+        self.serial.write(b'!')
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self._query_state_unlocked()
+            if status and self._is_standstill(status):
+                return True
+            time.sleep(0.1)
+        self.logger.error("Machine did not come to a standstill after feed hold")
+        return False
+
+    @staticmethod
+    def _is_standstill(status: Dict) -> bool:
+        """True when no motion is in progress (safe to soft-reset)."""
+        state = status.get('state')
+        if state == 'Hold':
+            return status.get('substate') == '0'  # Hold:0 = hold complete
+        return state in ('Idle', 'Alarm', 'Critical')
 
     def disconnect(self):
         """Disconnect from FluidNC."""
@@ -268,6 +332,18 @@ class FluidNCHandler:
         """
         self._status_callback = callback
 
+    def on_alarm(self, callback: Callable[[str], None]):
+        """Register callback for FluidNC alarms (argument: alarm text)."""
+        self._alarm_callback = callback
+
+    def on_unexpected_reset(self, callback: Callable[[], None]):
+        """Register callback for resets/reboots the daemon did not request."""
+        self._reset_callback = callback
+
+    def on_disconnect(self, callback: Callable[[], None]):
+        """Register callback for loss of the serial connection."""
+        self._disconnect_callback = callback
+
     def enable_auto_report(self, interval_ms: int = 100) -> bool:
         """
         Enable automatic status reporting from FluidNC.
@@ -312,6 +388,7 @@ class FluidNCHandler:
                         self._dispatch_message(line)
                 else:
                     time.sleep(0.01)
+                self._consecutive_read_errors = 0
 
                 # Periodic stale command check
                 if time.time() - last_stale_check > STALE_CHECK_INTERVAL:
@@ -323,6 +400,20 @@ class FluidNCHandler:
                     last_buffer_log = time.time()
                     self._log_periodic_health()
 
+            except (serial.SerialException, OSError) as e:
+                # USB disconnect: the port will not recover by itself. Report
+                # it once instead of logging the same I/O error forever.
+                self._consecutive_read_errors += 1
+                if self._consecutive_read_errors >= 5:
+                    self.logger.error(f"FluidNC serial port lost: {e}")
+                    self._running = False
+                    if self._disconnect_callback:
+                        try:
+                            self._disconnect_callback()
+                        except Exception as cb_err:
+                            self.logger.error(f"Error in disconnect callback: {cb_err}")
+                    break
+                time.sleep(0.1)
             except Exception as e:
                 self.logger.error(f"Error in FluidNC read loop: {e}")
                 time.sleep(0.1)
@@ -491,6 +582,10 @@ class FluidNCHandler:
 
     def _check_stale_commands(self, timeout: float):
         """Check for commands that have been pending too long."""
+        # While moving, FluidNC legitimately withholds "ok" until planner space
+        # frees up. Timing those commands out would desynchronize the ok FIFO.
+        if self._cached_state != 'Idle':
+            return
         now = time.time()
         with self._pending_lock:
             stale = []
@@ -532,6 +627,7 @@ class FluidNCHandler:
                     self._cached_position_time = time.time()
                 if 'state' in status:
                     self._cached_state = status['state']
+                    self._cached_substate = status.get('substate')
 
                 # Feed the position tracer (records sample, detects
                 # discontinuities, logs state transitions).
@@ -551,9 +647,41 @@ class FluidNCHandler:
             # Command acknowledged - deliver to waiting caller
             self.logger.debug(f"Dispatch: command response '{line}'")
             self._deliver_response(line)
+        elif line.startswith('ALARM:'):
+            self._handle_alarm(line)
+        elif line.startswith('Grbl '):
+            # Startup banner: FluidNC was reset or rebooted.
+            if time.time() > self._expect_reset_until:
+                self.logger.error(f"FluidNC restarted unexpectedly: {line}")
+                self.tracer.note_soft_reset()
+                if self._reset_callback:
+                    try:
+                        self._reset_callback()
+                    except Exception as e:
+                        self.logger.error(f"Error in reset callback: {e}")
+            else:
+                # The banner of our own reset: expect no further one
+                self._expect_reset_until = 0.0
+                self.logger.info(f"FluidNC: {line}")
+        elif line.startswith('[MSG:'):
+            if 'ALARM' in line.upper() and not line.startswith('[MSG:DBG'):
+                self._handle_alarm(line)
+            elif line.startswith('[MSG:DBG'):
+                self.logger.debug(f"FluidNC: {line}")
+            else:
+                self.logger.info(f"FluidNC: {line}")
         else:
-            # Other messages (info, welcome, etc.)
+            # Other messages (echo, settings, etc.)
             self.logger.debug(f"Dispatch: other message '{line}'")
+
+    def _handle_alarm(self, line: str):
+        """Report a FluidNC alarm to the log and the registered callback."""
+        self.logger.warning(f"FluidNC alarm: {line}")
+        if self._alarm_callback:
+            try:
+                self._alarm_callback(line)
+            except Exception as e:
+                self.logger.error(f"Error in alarm callback: {e}")
 
     def _sync_buffer_from_status(self, buffer_info: Dict):
         """
@@ -623,7 +751,11 @@ class FluidNCHandler:
             # it was genuinely lost on the serial line.
             planner_available = buffer_info.get('planner_available', 0)
             LOST_OK_THRESHOLD = 5.0
-            if rx_available >= self._buffer_size and planner_available > 0:
+            # Only while Idle: during homing or motion an "ok" can legitimately
+            # take much longer than the threshold (e.g. $HY answers after the
+            # whole homing cycle).
+            idle = self._cached_state == 'Idle'
+            if idle and rx_available >= self._buffer_size and planner_available > 0:
                 while self._pending_deque:
                     oldest = self._pending_deque[0]
                     if oldest.sent_timestamp <= 0:
@@ -751,6 +883,19 @@ class FluidNCHandler:
         # Create pending command tracker
         pending = PendingCommand(gcode=gcode, cmd_len=cmd_len)
 
+        # Hold the send lock from the space check until the command is on the
+        # wire; otherwise two threads can both see the same free space.
+        with self._send_lock:
+            if not self._send_checked(gcode, pending, cmd_len, timeout):
+                return False
+        return self._await_response(gcode, pending, wait_ok, timeout)
+
+    def _send_checked(self, gcode: str, pending: 'PendingCommand', cmd_len: int,
+                      timeout: float) -> bool:
+        """Wait for buffer space, then send and register the command.
+
+        Caller must hold _send_lock.
+        """
         # Wait for buffer space if needed (flow control)
         # Read-only check: do NOT increment _buffer_used here.
         # The increment happens atomically with the serial write below.
@@ -798,7 +943,11 @@ class FluidNCHandler:
                 self.logger.debug(f"Buffer space OK for '{gcode}': {old_used} + {cmd_len} = {self._buffer_used}/{self._buffer_size}")
                 if self._buffer_used >= self._buffer_size - 50:
                     self._buffer_space_event.clear()
+        return True
 
+    def _await_response(self, gcode: str, pending: 'PendingCommand', wait_ok: bool,
+                        timeout: float) -> bool:
+        """Wait for the ok/error belonging to an already-sent command."""
         if not wait_ok:
             return True
 
@@ -916,15 +1065,72 @@ class FluidNCHandler:
         with self._serial_lock:
             return self._readline_unlocked(timeout)
 
-    def home(self) -> bool:
+    def home(self, timeout: float = 120.0) -> bool:
         """
-        Execute homing sequence.
+        Execute the homing cycle ($H). The read thread must not be running.
+
+        Returns True only if FluidNC acknowledged $H with "ok". Callers must
+        still verify the resulting state and position: older firmware answers
+        "ok" even when the cycle ended in an alarm.
+        """
+        if self._running:
+            raise RuntimeError("home() requires the read thread to be stopped")
+        self.logger.info("Starting homing sequence")
+        with self._serial_lock:
+            self.serial.reset_input_buffer()
+            if not self._send_unlocked("$H"):
+                return False
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                line = self._readline_unlocked(timeout=0.2)
+                if not line:
+                    continue
+                if line.startswith('ok'):
+                    return True
+                if line.startswith('error:'):
+                    self.logger.error(f"Homing rejected by FluidNC: {line}")
+                    return False
+                if line.startswith('ALARM:') or 'ALARM' in line.upper():
+                    self.logger.error(f"Alarm during homing: {line}")
+                elif line.startswith('[MSG:') and not line.startswith('[MSG:DBG'):
+                    self.logger.info(f"FluidNC: {line}")
+            self.logger.error(f"Homing did not finish within {timeout:.0f}s")
+            return False
+
+    def stop_motion(self, timeout: float = 5.0) -> bool:
+        """
+        Stop all motion WITHOUT losing position and discard queued commands.
+
+        Feed hold ('!') decelerates under control; once the hold is complete
+        a soft reset flushes the planner and serial buffers. FluidNC keeps its
+        position in that case (a reset during motion would lose it).
 
         Returns:
-            True if homing successful, False otherwise
+            True if the machine came to a controlled standstill first.
         """
-        self.logger.info("Starting homing sequence")
-        return self.send_gcode("$H", wait_ok=True, timeout=60.0)
+        try:
+            with self._serial_lock:
+                if not self.serial or not self.serial.is_open:
+                    return False
+                self.serial.write(b'!')
+        except Exception as e:
+            self.logger.error(f"Error sending feed hold: {e}")
+            return False
+
+        held = False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.get_cached_status(max_age=0.3) if self._running else None
+            if status is None:
+                status = self.get_status()
+            if status and self._is_standstill(status):
+                held = True
+                break
+            time.sleep(0.05)
+        if not held:
+            self.logger.error("Feed hold did not complete - reset may lose position")
+        self.soft_reset()
+        return held
 
     def get_limits(self) -> Dict[str, Tuple[float, float]]:
         """
@@ -1098,19 +1304,25 @@ class FluidNCHandler:
             # Split by |
             parts = status_line.split('|')
 
+            # "Hold:0" -> state "Hold", substate "0"
+            state, _, substate = parts[0].partition(':')
             result = {
-                'state': parts[0],
-                'position': {'X': 0.0, 'Y': 0.0, 'Z': 0.0}
+                'state': state,
+                'substate': substate or None,
             }
 
             # Parse all fields
-            for part in parts:
+            for part in parts[1:]:
                 if part.startswith('MPos:') or part.startswith('WPos:'):
                     coords = part.split(':')[1].split(',')
                     if len(coords) >= 3:
-                        result['position']['X'] = float(coords[0])
-                        result['position']['Y'] = float(coords[1])
-                        result['position']['Z'] = float(coords[2])
+                        result['position'] = {
+                            'X': float(coords[0]),
+                            'Y': float(coords[1]),
+                            'Z': float(coords[2]),
+                        }
+                elif part.startswith('Pn:'):
+                    result['pins'] = part[3:]
                 elif part.startswith('Bf:'):
                     # Buffer status: Bf:planner_blocks,rx_chars_available
                     bf_values = part.split(':')[1].split(',')
@@ -1120,6 +1332,11 @@ class FluidNCHandler:
                             'rx_available': int(bf_values[1])
                         }
 
+            # A report without a position is truncated or garbled. Returning a
+            # made-up (0,0,0) would silently corrupt every position consumer.
+            if 'position' not in result:
+                self.logger.debug(f"Status without position ignored: {status_line!r}")
+                return None
             return result
 
         except Exception as e:
@@ -1174,6 +1391,7 @@ class FluidNCHandler:
         with self._serial_lock:
             try:
                 if self.serial and self.serial.is_open:
+                    self._expect_reset_until = time.time() + 5.0
                     self.serial.write(b'\x18')
                     self.logger.info("Soft reset sent")
                     self.tracer.note_soft_reset()

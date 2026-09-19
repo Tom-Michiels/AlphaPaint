@@ -5,6 +5,7 @@ Manages communication with external drawing programs via stdin/stdout JSON proto
 
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -26,6 +27,20 @@ class ExternalProgramHandler:
     ERR_COMMUNICATION_ERROR = 104
     ERR_INVALID_METHOD = 105
     ERR_INTERRUPTED = 106
+
+    # Arcs with a larger radius are sent as straight lines. Their sagitta is
+    # negligible, and huge radii stress FluidNC's float math (a mis-signed
+    # sweep turns a tiny arc into a near-full circle far off the canvas).
+    MAX_ARC_RADIUS_MM = 2000.0
+    # FluidNC rejects arcs whose start/end radius differ more than this
+    ARC_RADIUS_TOLERANCE_MM = 0.5
+
+    # Methods that move the machine; refused once the program is interrupted
+    MOTION_METHODS = {
+        'pen_up', 'pen_up_fast', 'pen_down', 'move_to', 'draw_to', 'draw_arc', 'rehome_y',
+        'canvas_move_to', 'canvas_draw_to', 'canvas_draw_arc',
+        'normalized_move_to', 'normalized_draw_to',
+    }
 
     def __init__(
         self,
@@ -150,6 +165,10 @@ class ExternalProgramHandler:
 
         self._interrupted = True
         self.logger.info("Interrupting external program")
+
+        # Stop the machine right away. Feed hold + reset discards everything
+        # already queued in FluidNC while keeping the position valid.
+        self.fluidnc.stop_motion()
 
         # Send interrupt event
         try:
@@ -295,9 +314,17 @@ class ExternalProgramHandler:
             'normalized_move_to': self._api_normalized_move_to,
             'normalized_draw_to': self._api_normalized_draw_to,
             'set_feedrate': self._api_set_feedrate,
+            'rehome_y': self._api_rehome_y,
             'flush': self._api_flush,
             'done': self._api_done,
         }
+
+        if self._interrupted and method in self.MOTION_METHODS:
+            self._send_response(
+                request_id,
+                error={'code': self.ERR_INTERRUPTED, 'message': "Program was interrupted"}
+            )
+            return
 
         handler = handlers.get(method)
         if handler:
@@ -396,7 +423,17 @@ class ExternalProgramHandler:
         status = self.fluidnc.get_status()
         if status and 'position' in status:
             return status['position']
-        return {'X': 0.0, 'Y': 0.0, 'Z': 0.0}
+        raise RuntimeError("Machine position unavailable")
+
+    def _send_motion(self, gcode: str, wait: bool) -> bool:
+        """Send a motion command; raise if FluidNC rejected it.
+
+        A rejected move means the program's idea of the pen position is now
+        wrong, so the program must be told instead of getting success=False.
+        """
+        if not self.fluidnc.send_gcode(gcode, wait_ok=wait):
+            raise RuntimeError(f"FluidNC rejected or did not acknowledge: {gcode}")
+        return True
 
     # API method implementations
 
@@ -450,25 +487,15 @@ class ExternalProgramHandler:
     def _api_pen_up(self, params: Dict) -> Dict:
         """Lift pen to safe height."""
         max_z = self.machine_limits['Z'][1]
-        success = self.fluidnc.send_gcode(
-            f"G0 Z{max_z:.2f}",
-            wait_ok=True,
-            timeout=5.0
-        )
-        if success:
-            self.pen_is_down = False
+        success = self._send_motion(f"G0 Z{max_z:.3f}", wait=True)
+        self.pen_is_down = False
         return {'success': success, 'z': max_z}
 
     def _api_pen_down(self, params: Dict) -> Dict:
         """Lower pen to drawing height."""
         feedrate = self.config['machine']['pen_lift_feedrate']
-        success = self.fluidnc.send_gcode(
-            f"G1 Z{self.pen_z:.2f} F{feedrate}",
-            wait_ok=True,
-            timeout=5.0
-        )
-        if success:
-            self.pen_is_down = True
+        success = self._send_motion(f"G1 Z{self.pen_z:.3f} F{feedrate}", wait=True)
+        self.pen_is_down = True
         return {'success': success, 'z': self.pen_z}
 
     def _api_pen_up_fast(self, params: Dict) -> Dict:
@@ -478,13 +505,8 @@ class ExternalProgramHandler:
         max_z = self.machine_limits['Z'][1]
         if target_z > max_z:
             target_z = max_z
-        success = self.fluidnc.send_gcode(
-            f"G0 Z{target_z:.2f}",
-            wait_ok=True,
-            timeout=5.0
-        )
-        if success:
-            self.pen_is_down = False
+        success = self._send_motion(f"G0 Z{target_z:.3f}", wait=True)
+        self.pen_is_down = False
         return {'success': success, 'z': target_z}
 
     def _api_move_to(self, params: Dict) -> Dict:
@@ -504,13 +526,13 @@ class ExternalProgramHandler:
         # Build G0 command
         cmd_parts = ["G0"]
         if x is not None:
-            cmd_parts.append(f"X{x:.2f}")
+            cmd_parts.append(f"X{x:.3f}")
         if y is not None:
-            cmd_parts.append(f"Y{y:.2f}")
+            cmd_parts.append(f"Y{y:.3f}")
         if z is not None:
-            cmd_parts.append(f"Z{z:.2f}")
+            cmd_parts.append(f"Z{z:.3f}")
 
-        success = self.fluidnc.send_gcode(" ".join(cmd_parts), wait_ok=wait)
+        success = self._send_motion(" ".join(cmd_parts), wait)
 
         if wait and success:
             pos = self._get_current_position()
@@ -541,14 +563,14 @@ class ExternalProgramHandler:
         # Build G1 command
         cmd_parts = ["G1"]
         if x is not None:
-            cmd_parts.append(f"X{x:.2f}")
+            cmd_parts.append(f"X{x:.3f}")
         if y is not None:
-            cmd_parts.append(f"Y{y:.2f}")
+            cmd_parts.append(f"Y{y:.3f}")
         if z is not None:
-            cmd_parts.append(f"Z{z:.2f}")
+            cmd_parts.append(f"Z{z:.3f}")
         cmd_parts.append(f"F{feedrate}")
 
-        success = self.fluidnc.send_gcode(" ".join(cmd_parts), wait_ok=wait)
+        success = self._send_motion(" ".join(cmd_parts), wait)
 
         if wait and success:
             pos = self._get_current_position()
@@ -578,11 +600,21 @@ class ExternalProgramHandler:
         if not valid:
             raise ValueError(error)
 
-        # G2 = clockwise, G3 = counter-clockwise
-        cmd = "G2" if clockwise else "G3"
-        gcode = f"{cmd} X{x:.2f} Y{y:.2f} I{i:.2f} J{j:.2f} F{feedrate}"
+        start = self.fluidnc.tracer.get_expected()
+        reason = self._arc_problem(start, x, y, i, j, clockwise)
+        if reason:
+            # Straight line to the same endpoint: always inside the machine
+            # (endpoint validated above) and never a runaway circle.
+            self.logger.warning(f"Arc to ({x:.3f},{y:.3f}) I{i:.3f} J{j:.3f} "
+                                f"sent as line: {reason}")
+            gcode = f"G1 X{x:.3f} Y{y:.3f} F{feedrate}"
+        else:
+            # G2 = clockwise, G3 = counter-clockwise. 4 decimals: rounding to
+            # 0.01 mm made FluidNC reject small arcs (error:33).
+            cmd = "G2" if clockwise else "G3"
+            gcode = f"{cmd} X{x:.4f} Y{y:.4f} I{i:.4f} J{j:.4f} F{feedrate}"
 
-        success = self.fluidnc.send_gcode(gcode, wait_ok=wait)
+        success = self._send_motion(gcode, wait)
 
         if wait and success:
             pos = self._get_current_position()
@@ -594,6 +626,39 @@ class ExternalProgramHandler:
             return {'success': False}
         else:
             return {'success': success, 'queued': True}
+
+    def _arc_problem(self, start: Optional[Dict[str, float]], x: float, y: float,
+                     i: float, j: float, clockwise: bool) -> Optional[str]:
+        """Return why an arc must not be sent as an arc, or None if it is fine."""
+        radius = math.hypot(i, j)
+        if radius > self.MAX_ARC_RADIUS_MM:
+            return f"radius {radius:.0f}mm exceeds {self.MAX_ARC_RADIUS_MM:.0f}mm"
+        if start is None:
+            return None  # Unknown start: cannot check further, FluidNC will
+        sx, sy = start['X'], start['Y']
+        cx, cy = sx + i, sy + j
+        end_radius = math.hypot(x - cx, y - cy)
+        if abs(end_radius - radius) > self.ARC_RADIUS_TOLERANCE_MM:
+            return (f"start/end radius mismatch {radius:.3f}/{end_radius:.3f}mm "
+                    f"(start {sx:.3f},{sy:.3f})")
+        # Every point of the swept path must stay inside the machine: check
+        # the circle's extreme points (0/90/180/270 deg) that lie in the sweep.
+        a0 = math.atan2(sy - cy, sx - cx)
+        a1 = math.atan2(y - cy, x - cx)
+        sweep = (a0 - a1) if clockwise else (a1 - a0)
+        sweep %= 2 * math.pi
+        if sweep < 1e-9:
+            sweep = 2 * math.pi  # FluidNC draws a full circle
+        for k in range(4):
+            ext = k * math.pi / 2
+            offset = ((a0 - ext) if clockwise else (ext - a0)) % (2 * math.pi)
+            if offset <= sweep:
+                px = cx + radius * math.cos(ext)
+                py = cy + radius * math.sin(ext)
+                ok, err = self._validate_machine_position(px, py)
+                if not ok:
+                    return f"arc path leaves machine area ({err})"
+        return None
 
     def _api_canvas_move_to(self, params: Dict) -> Dict:
         """Rapid move in canvas coordinates."""
@@ -649,6 +714,35 @@ class ExternalProgramHandler:
         mx, my = self._normalized_to_machine(x, y)
         return self._api_draw_to({'x': mx, 'y': my, 'feedrate': feedrate, 'wait': wait})
 
+    def _api_rehome_y(self, params: Dict) -> Dict:
+        """Re-home the Y axis to wipe out any accumulated Y offset.
+
+        The pen goes up and the gantry moves to the X position where the
+        full homing cycle also homes Y (known to be free of obstacles such as
+        the pen changer), then FluidNC runs a Y-only homing cycle.
+        """
+        machine_cfg = self.config.get('machine', {})
+        safe_x = float(machine_cfg.get('rehome_safe_x', 0.0))
+        home_y = float((machine_cfg.get('home_position') or {}).get('Y', 0.0))
+
+        self._api_pen_up({})
+        self._send_motion(f"G0 X{safe_x:.3f}", wait=True)
+        # Wait until the move has really finished before homing
+        self._send_motion("G4 P0", wait=True)
+        before = self._get_current_position()
+
+        if not self.fluidnc.send_gcode("$HY", wait_ok=True, timeout=90.0):
+            raise RuntimeError("Y re-homing failed")
+        self.fluidnc.send_gcode("G4 P0", wait_ok=True, timeout=10.0)
+        status = self.fluidnc.get_status()
+        if (not status or status['state'] != 'Idle'
+                or abs(status['position']['Y'] - home_y) > 0.5):
+            raise RuntimeError(f"Y re-homing not verified (status={status})")
+        self.logger.info(f"Y re-homed (Y was {before['Y']:.3f} before re-homing)")
+        return {'success': True, 'position': {
+            'x': status['position']['X'], 'y': status['position']['Y'],
+            'z': status['position']['Z']}}
+
     def _api_set_feedrate(self, params: Dict) -> Dict:
         """Set default drawing feedrate."""
         feedrate = params.get('feedrate')
@@ -685,8 +779,11 @@ class ExternalProgramHandler:
             self._done_called = True
             return {'success': True}
 
-        # Wait for all motion to complete before lifting pen
+        # Wait for all motion to complete before lifting pen. G4 P0 is only
+        # acknowledged once everything before it has executed, so Idle after
+        # it cannot be a stale report from before the last moves started.
         self.logger.info("Waiting for FluidNC to complete all motion...")
+        self.fluidnc.send_gcode("G4 P0", wait_ok=True, timeout=wait_timeout)
         if not self.fluidnc.wait_idle(timeout=wait_timeout):
             self.logger.warning("Timeout waiting for FluidNC idle before done")
 

@@ -178,14 +178,11 @@ class PositionTracer:
             self._last_cmd = cmd
             self._last_cmd_time = time.time()
 
-            words = _parse_words(cmd)
-            if not words:
-                return
-
-            # Detect special $-commands first.
+            # Detect special $-commands first. They carry no G-code words
+            # ("$H" has no number), so check them before the empty-words exit.
             cmd_upper = cmd.upper()
-            if cmd_upper.startswith('$H'):
-                self._handle_homing()
+            if re.fullmatch(r'\$H[XYZ]*', cmd_upper):
+                self._handle_homing(cmd_upper[2:].strip())
                 self._write_event('CMD', f'homing: {cmd}')
                 return
             if cmd_upper.startswith('$X'):
@@ -201,6 +198,10 @@ class PositionTracer:
                 self._handle_motion_words(_parse_words(cmd[3:]),
                                           jog_local_mode=True)
                 self._last_motion_cmd_time = self._last_cmd_time
+                return
+
+            words = _parse_words(cmd)
+            if not words:
                 return
 
             # Detect modal/coordinate changes from G-words.
@@ -337,9 +338,15 @@ class PositionTracer:
         except ValueError:
             return -1
 
-    def _handle_homing(self):
+    def _handle_homing(self, axes: str = ''):
+        """$H homes all axes; $HY (etc.) only the listed ones."""
         self._stats['homings'] += 1
-        self._expected = dict(self.DEFAULT_HOME_MPOS)
+        homed = [a for a in axes if a in self.DEFAULT_HOME_MPOS]
+        if not homed or self._expected is None:
+            self._expected = dict(self.DEFAULT_HOME_MPOS)
+        else:
+            for axis in homed:
+                self._expected[axis] = self.DEFAULT_HOME_MPOS[axis]
         self.logger.info(
             f"$H homing — expected MPos reset to "
             f"{self._fmt_pos(self._expected)}")

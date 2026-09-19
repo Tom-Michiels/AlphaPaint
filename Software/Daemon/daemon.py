@@ -50,6 +50,8 @@ class AlphaPaintDaemon:
         self._console_port: Optional[str] = None
         self._fluidnc_port: Optional[str] = None
         self._needs_reconnect = False
+        # FluidNC port lost: full rescan (the machine position is unknown)
+        self._needs_rescan = False
         self._reconnect_lock = threading.Lock()
 
         # Setup signal handlers
@@ -151,6 +153,12 @@ class AlphaPaintDaemon:
             self._needs_reconnect = True
             self.logger.warning("Console disconnected - will attempt reconnection")
 
+    def _on_fluidnc_disconnected(self):
+        """Called from the FluidNC read thread when its port stops working."""
+        with self._reconnect_lock:
+            self._needs_rescan = True
+        self.logger.error("FluidNC disconnected - will rescan devices")
+
     def _scan_serial_ports(self) -> list:
         """
         Scan for available serial ports.
@@ -209,7 +217,8 @@ class AlphaPaintDaemon:
                 self.config['serial']['baud_rate'],
                 self.config['serial']['timeout']
             )
-            if fluidnc.connect():
+            # Probe only: no reset, no motion changes on an unknown device
+            if fluidnc.connect(reset=False):
                 if fluidnc.identify():
                     fluidnc.disconnect()
                     self.logger.info(f"  → FluidNC detected on {port}")
@@ -297,66 +306,37 @@ class AlphaPaintDaemon:
 
         self.logger.info(f"Attempting to reconnect to Console on {self._console_port}...")
 
-        # First, clean up existing connections
-        self._cleanup_connections()
+        # Only the console is replaced. FluidNC and the state machine keep
+        # running: a flaky console cable must not reset the controller or
+        # abort a drawing.
+        if self.console:
+            try:
+                self.console.disconnect()
+            except Exception as e:
+                self.logger.debug(f"Error disconnecting console: {e}")
+            self.console = None
 
         # Wait a moment for the device to be ready
         time.sleep(1.0)
 
-        # Try to reconnect to console on same port
         try:
-            self.console = ConsoleHandler(
+            console = ConsoleHandler(
                 self._console_port,
                 self.config['serial']['baud_rate'],
                 self.config['serial']['timeout']
             )
-            if not self.console.connect():
+            if not console.connect():
                 self.logger.error("Failed to reconnect to Console")
-                self.console = None
                 return False
-
-            # Register disconnect callback
-            self.console.on_disconnect(self._on_console_disconnected)
-
+            console.on_disconnect(self._on_console_disconnected)
         except Exception as e:
             self.logger.error(f"Error reconnecting to Console: {e}")
-            self.console = None
             return False
 
-        # Reconnect to FluidNC (it should still be there)
-        try:
-            self.fluidnc = FluidNCHandler(
-                self._fluidnc_port,
-                self.config['serial']['baud_rate'],
-                self.config['serial']['timeout'],
-                trace_file=self.config.get('debugging', {}).get('position_trace_file')
-            )
-            if not self.fluidnc.connect():
-                self.logger.error("Failed to reconnect to FluidNC")
-                self.console.disconnect()
-                self.console = None
-                self.fluidnc = None
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Error reconnecting to FluidNC: {e}")
-            self.console.disconnect()
-            self.console = None
-            self.fluidnc = None
-            return False
-
-        # Recreate state machine
-        self.state_machine = StateMachine(
-            self.console,
-            self.fluidnc,
-            self.config
-        )
-
-        # Start Console read thread
+        self.console = console
         self.console.start()
-
-        # Start state machine
-        self.state_machine.start()
+        if self.state_machine:
+            self.state_machine.replace_console(console)
 
         self.logger.info("Successfully reconnected to Console")
         return True
@@ -372,9 +352,10 @@ class AlphaPaintDaemon:
 
         while self.running:
             try:
-                # Reset reconnect flag
+                # Reset reconnect flags
                 with self._reconnect_lock:
                     self._needs_reconnect = False
+                    self._needs_rescan = False
 
                 # Scan and connect to devices
                 console_port, fluidnc_port = self._scan_and_connect()
@@ -416,6 +397,7 @@ class AlphaPaintDaemon:
                     self.console.disconnect()
                     time.sleep(self.config['serial']['reconnect_delay'])
                     continue
+                self.fluidnc.on_disconnect(self._on_fluidnc_disconnected)
 
                 motion_limits = self.config.get('motion_limits') or {}
                 if motion_limits:
@@ -443,6 +425,11 @@ class AlphaPaintDaemon:
                     # Check if reconnection is needed
                     with self._reconnect_lock:
                         needs_reconnect = self._needs_reconnect
+                        needs_rescan = self._needs_rescan
+
+                    if needs_rescan:
+                        self.logger.warning("FluidNC connection lost, rescanning devices")
+                        break  # Exit inner loop; finally-block cleans up
 
                     if needs_reconnect:
                         self.logger.info("Reconnection requested, attempting...")
@@ -450,6 +437,7 @@ class AlphaPaintDaemon:
                         # Try quick reconnect first (same port)
                         reconnect_attempts = 0
                         max_attempts = 3
+                        reconnected = False
 
                         while reconnect_attempts < max_attempts and self.running:
                             reconnect_attempts += 1
@@ -458,11 +446,12 @@ class AlphaPaintDaemon:
                             if self._try_reconnect_console():
                                 with self._reconnect_lock:
                                     self._needs_reconnect = False
+                                reconnected = True
                                 break
 
                             time.sleep(self.config['serial']['reconnect_delay'])
 
-                        if reconnect_attempts >= max_attempts:
+                        if not reconnected:
                             self.logger.warning("Quick reconnect failed, will rescan for devices")
                             break  # Exit inner loop to rescan
 

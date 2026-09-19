@@ -23,6 +23,14 @@ class StateMachine:
     STATE_EXTERNAL_PROGRAM = "EXTERNAL_PROGRAM"
     STATE_ERROR = "ERROR"
 
+    # States in which the machine position is trusted (homed and verified)
+    HOMED_STATES = ("CANVAS_SETUP", "READY", "DRAWING", "EXTERNAL_PROGRAM")
+
+    DEFAULT_LIMITS = {'X': (0.0, 300.0), 'Y': (-150.0, 150.0), 'Z': (0.0, 50.0)}
+    # Maximum deviation (mm) between reported MPos and the configured home
+    # position after homing before the result is rejected.
+    HOME_POSITION_TOLERANCE = 0.5
+
     def __init__(
         self,
         console: ConsoleHandler,
@@ -41,6 +49,22 @@ class StateMachine:
         self.fluidnc = fluidnc
         self.config = config
         self.logger = logging.getLogger(__name__)
+
+        # Callbacks arrive from the console thread, the FluidNC read thread,
+        # the homing thread and the external-program thread. All state
+        # changes go through this lock.
+        self._lock = threading.RLock()
+        # Set while a machine-position loss is being handled, so repeated
+        # alarm reports do not trigger repeated recoveries.
+        self._position_lost_pending = False
+
+        # Expected machine position right after homing (FluidNC mpos_mm)
+        home = config.get('machine', {}).get('home_position') or {}
+        self.home_position = {
+            'X': float(home.get('X', 0.0)),
+            'Y': float(home.get('Y', 0.0)),
+            'Z': float(home.get('Z', 60.0)),
+        }
 
         # State variables
         self.state = self.STATE_STARTUP
@@ -71,15 +95,54 @@ class StateMachine:
 
     def _register_callbacks(self):
         """Register callbacks for Console and FluidNC messages."""
-        # Console callbacks
+        self._register_console_callbacks()
+
+        # FluidNC status callback for continuous position updates
+        self.fluidnc.on_status(self._on_fluidnc_status)
+        # Anything that invalidates the machine position
+        self.fluidnc.on_alarm(self._on_fluidnc_alarm)
+        self.fluidnc.on_unexpected_reset(self._on_fluidnc_unexpected_reset)
+
+    def _register_console_callbacks(self):
         self.console.on_message('BTN', self._on_button)
         self.console.on_message('POS', self._on_position)
         self.console.on_message('AXIS', self._on_axis)
         self.console.on_message('PRECISION', self._on_precision)
         self.console.on_message('STATUS', self._on_status)
 
-        # FluidNC status callback for continuous position updates
-        self.fluidnc.on_status(self._on_fluidnc_status)
+    def replace_console(self, console: ConsoleHandler):
+        """Attach a reconnected console without touching FluidNC.
+
+        The console may have rebooted, so its display, limits, LEDs and mode
+        are rebuilt from the daemon's state.
+        """
+        with self._lock:
+            self.console = console
+            self._register_console_callbacks()
+            self.console.reset()
+            if self.homed:
+                for axis in ('X', 'Y', 'Z'):
+                    min_val, max_val = self.machine_limits[axis]
+                    self.console.set_limit(axis, min_val, max_val)
+                    self.console.set_position(axis, self.current_pos[axis])
+            # Re-run the entry action of the current state for LEDs and mode
+            if self.state == self.STATE_NOT_HOMED:
+                self._enter_not_homed()
+            elif self.state == self.STATE_CANVAS_SETUP:
+                self._enter_canvas_setup()
+                self._set_console_mode('ACTIVE')
+            elif self.state == self.STATE_READY:
+                self._enter_ready()
+                self._set_console_mode('ACTIVE')
+            elif self.state == self.STATE_EXTERNAL_PROGRAM and self.active_external_button:
+                self._enter_external_program(self.active_external_button, transition=False)
+            elif self.state == self.STATE_ERROR:
+                self._error_blink_all()
+            self.logger.info(f"Console re-attached in state {self.state}")
+
+    def _set_console_mode(self, mode: str):
+        self.console.set_mode(mode)
+        self.console_mode = mode
 
     def start(self):
         """Start the state machine."""
@@ -117,6 +180,10 @@ class StateMachine:
         Args:
             new_state: New state name
         """
+        with self._lock:
+            self._transition_locked(new_state)
+
+    def _transition_locked(self, new_state: str):
         old_state = self.state
         self.state = new_state
         self.logger.info(f"State transition: {old_state} → {new_state}")
@@ -137,8 +204,8 @@ class StateMachine:
         self.console.set_led('D', 'OFF')
         self.console.set_led('E', 'OFF')
         self.console.set_led('F', 'OFF')
-        self.console.set_mode('PASSIVE')
-        self.console_mode = 'PASSIVE'
+        self.console.set_led('G', 'OFF')
+        self._set_console_mode('PASSIVE')
 
     def _enter_canvas_setup(self):
         """Enter CANVAS_SETUP state."""
@@ -197,7 +264,10 @@ class StateMachine:
             action: SHORT or LONG
         """
         self.logger.info(f"Button {button} {action} in state {self.state}")
+        with self._lock:
+            self._on_button_locked(button, action)
 
+    def _on_button_locked(self, button: str, action: str):
         # Button A - Homing
         if button == 'A':
             if action == 'SHORT':
@@ -236,30 +306,18 @@ class StateMachine:
 
     def _on_button_A_long(self):
         """Handle button A long press - re-home from any state."""
+        if self.state == self.STATE_HOMING:
+            self.logger.info("Re-homing ignored: homing already in progress")
+            return
         self.logger.info("Re-homing requested")
 
-        # If external program is running, interrupt it first
-        if self.state == self.STATE_EXTERNAL_PROGRAM and self.external_handler:
+        # If external program is running, interrupt it first. interrupt()
+        # stops the machine with feed hold + reset, keeping its position.
+        if self.external_handler:
             self.logger.info("Interrupting external program for re-homing")
             self.external_handler.interrupt()
             self.external_handler = None
             self.active_external_button = None
-
-        # Cancel any active jog
-        if self.console_mode == "ACTIVE":
-            self.fluidnc.cancel_jog()
-
-        # Lift pen for safety before re-homing
-        max_z = self.machine_limits['Z'][1]
-        self.fluidnc.send_gcode(f"G0 Z{max_z:.2f}", wait_ok=True, timeout=5.0)
-
-        # Wait for FluidNC to reach Idle state before proceeding
-        if not self.fluidnc.wait_idle(timeout=5.0):
-            self.logger.warning("FluidNC not idle, sending soft reset")
-            self.fluidnc.soft_reset()
-
-        # Stop FluidNC read thread before re-homing
-        self.fluidnc.stop()
 
         # Reset state
         self.homed = False
@@ -267,80 +325,99 @@ class StateMachine:
         self.point_C = None
         self.pen_Z = self.config['machine']['pen_z_default']
 
-        # Start homing immediately
+        # Start homing immediately. The homing thread brings the machine to a
+        # controlled stop first; the pen lifts as the first homing cycle (Z).
         self._start_homing_sequence()
 
     def _start_homing_sequence(self):
-        """Start homing sequence."""
+        """Start homing sequence. Caller must hold the lock."""
+        if self.state == self.STATE_HOMING:
+            self.logger.info("Homing already in progress")
+            return
         self.logger.info("Starting homing sequence")
-        self.transition(self.STATE_HOMING)
+        self._transition_locked(self.STATE_HOMING)
+        self.homed = False
+        # No handwheel jogs while homing: they would queue up in FluidNC and
+        # run right after homing towards a stale target.
+        self._set_console_mode('PASSIVE')
         self.console.set_led('A', 'FAST_BLINK')
 
         # Execute homing in background thread to avoid blocking
         threading.Thread(target=self._execute_homing, daemon=True).start()
 
+    def _homing_failed(self, reason: str):
+        self.logger.error(f"Homing failed: {reason}")
+        with self._lock:
+            self.homed = False
+            self._transition_locked(self.STATE_ERROR)
+            self._error_blink_all()
+
     def _execute_homing(self):
         """Execute homing (runs in background thread)."""
         try:
-            # Clear any stuck state before homing
-            self.fluidnc.soft_reset()
-            time.sleep(0.2)  # Brief pause after reset
+            # Direct serial access during homing: stop the read thread
+            self.fluidnc.stop()
 
-            # Send home command to FluidNC
-            if not self.fluidnc.home():
-                self.logger.error("Homing failed")
-                self.transition(self.STATE_ERROR)
-                self._error_blink_all()
-                return
-
-            # Wait for FluidNC to fully settle after homing
+            # Bring any motion to a controlled stop and flush queued commands.
+            # (A plain Ctrl-X while moving makes FluidNC lose its position.)
+            self.fluidnc.stop_motion()
             time.sleep(0.5)
 
-            # Read machine limits (with retry logic)
-            self.machine_limits = self.fluidnc.get_limits()
+            if not self.fluidnc.home():
+                self._homing_failed("FluidNC did not complete $H")
+                return
 
-            # Validate that we got real limits, not defaults
-            default_limits = {'X': (0.0, 300.0), 'Y': (-150.0, 150.0), 'Z': (0.0, 50.0)}
-            if self.machine_limits == default_limits:
-                self.logger.warning("Got default limits - FluidNC may not have responded correctly")
-
-            # Get current position
+            # Verify the result: older firmware answers "ok" even when the
+            # cycle ended in an alarm, e.g. a limit switch that was missed.
+            time.sleep(0.3)
             status = self.fluidnc.get_status()
-            if status:
-                self.current_pos = status['position']
+            if not status:
+                self._homing_failed("no status after homing")
+                return
+            if status['state'] != 'Idle':
+                self._homing_failed(f"FluidNC state is {status['state']} after homing")
+                return
+            pos = status['position']
+            off = {a: abs(pos[a] - self.home_position[a]) for a in ('X', 'Y', 'Z')}
+            if max(off.values()) > self.HOME_POSITION_TOLERANCE:
+                self._homing_failed(f"position {pos} is not the home position {self.home_position}")
+                return
 
-            # Send position to Console
-            self.console.set_position('X', self.current_pos['X'])
-            self.console.set_position('Y', self.current_pos['Y'])
-            self.console.set_position('Z', self.current_pos['Z'])
+            # Read machine limits (with retry logic)
+            limits = self.fluidnc.get_limits()
+            if limits == self.DEFAULT_LIMITS:
+                # Never run with guessed limits: the console and the
+                # external programs trust them as the machine boundaries.
+                self._homing_failed("could not read machine limits from FluidNC")
+                return
 
-            # Send limits to Console
-            for axis in ['X', 'Y', 'Z']:
-                min_val, max_val = self.machine_limits[axis]
-                self.console.set_limit(axis, min_val, max_val)
-
-            # Enable automatic status reporting from FluidNC (100ms interval)
+            # Start the read thread first so the "ok"s of the auto-report
+            # setup are matched to their commands (no orphaned oks).
+            self.fluidnc.start()
             self.fluidnc.enable_auto_report(100)
 
-            # Start FluidNC read thread now that auto-reporting is enabled
-            self.fluidnc.start()
+            with self._lock:
+                if self.state != self.STATE_HOMING:
+                    self.logger.warning(f"Homing finished but state is {self.state}; ignoring result")
+                    return
+                self.machine_limits = limits
+                self.current_pos = dict(pos)
 
-            # Enable ACTIVE mode
-            self.console.set_mode('ACTIVE')
-            self.console_mode = 'ACTIVE'
+                for axis in ['X', 'Y', 'Z']:
+                    self.console.set_position(axis, self.current_pos[axis])
+                    min_val, max_val = self.machine_limits[axis]
+                    self.console.set_limit(axis, min_val, max_val)
 
-            # Update flags
-            self.homed = True
+                self._position_lost_pending = False
+                self.homed = True
+                self._set_console_mode('ACTIVE')
+                self._transition_locked(self.STATE_CANVAS_SETUP)
 
-            # Transition to CANVAS_SETUP
-            self.transition(self.STATE_CANVAS_SETUP)
-
-            self.logger.info("Homing complete")
+            self.logger.info(f"Homing complete and verified at {pos}")
 
         except Exception as e:
-            self.logger.error(f"Error during homing: {e}")
-            self.transition(self.STATE_ERROR)
-            self._error_blink_all()
+            self.logger.error(f"Error during homing: {e}", exc_info=True)
+            self._homing_failed(str(e))
 
     def _on_button_B(self):
         """Handle button B - set canvas corner 1."""
@@ -525,14 +602,16 @@ class StateMachine:
             self.external_handler = None
             self._error_blink_all()
 
-    def _enter_external_program(self, button: str):
+    def _enter_external_program(self, button: str, transition: bool = True):
         """
         Enter EXTERNAL_PROGRAM state.
 
         Args:
             button: Button that triggered the program (E, F, or G)
+            transition: False when only refreshing the console
         """
-        self.transition(self.STATE_EXTERNAL_PROGRAM)
+        if transition:
+            self._transition_locked(self.STATE_EXTERNAL_PROGRAM)
 
         # All LEDs off except active button (fast blink)
         for led in ['A', 'B', 'C', 'D', 'E', 'F', 'G']:
@@ -540,8 +619,7 @@ class StateMachine:
         self.console.set_led(button, 'FAST_BLINK')
 
         # Set console to passive mode
-        self.console.set_mode('PASSIVE')
-        self.console_mode = 'PASSIVE'
+        self._set_console_mode('PASSIVE')
 
     def _on_external_program_complete(self, success: bool):
         """
@@ -551,23 +629,22 @@ class StateMachine:
             success: True if program completed successfully
         """
         self.logger.info(f"External program completed (success={success})")
+        with self._lock:
+            # If we're no longer in EXTERNAL_PROGRAM state (e.g., re-homing was
+            # triggered), the state machine has already moved on
+            if self.state != self.STATE_EXTERNAL_PROGRAM:
+                self.logger.info("State already changed, skipping completion transition")
+                return
 
-        # If we're no longer in EXTERNAL_PROGRAM state (e.g., re-homing was triggered),
-        # the state machine has already moved on - don't transition
-        if self.state != self.STATE_EXTERNAL_PROGRAM:
-            self.logger.info("State already changed, skipping completion transition")
-            return
+            self.external_handler = None
+            self.active_external_button = None
 
-        self.external_handler = None
-        self.active_external_button = None
-
-        if success:
-            self.transition(self.STATE_READY)
-            self.console.set_mode('ACTIVE')
-            self.console_mode = 'ACTIVE'
-        else:
-            self.transition(self.STATE_ERROR)
-            self._error_blink_all()
+            if success:
+                self._transition_locked(self.STATE_READY)
+                self._set_console_mode('ACTIVE')
+            else:
+                self._transition_locked(self.STATE_ERROR)
+                self._error_blink_all()
 
     # ========== Position/Axis Handlers ==========
 
@@ -579,21 +656,33 @@ class StateMachine:
             axis: Axis (X, Y, or Z)
             value_str: Position value as string
         """
-        if self.console_mode != "ACTIVE":
-            return
+        with self._lock:
+            if self.console_mode != "ACTIVE" or not self.homed:
+                return
+            if self.state not in (self.STATE_CANVAS_SETUP, self.STATE_READY):
+                return
+            if axis not in self.machine_limits:
+                self.logger.error(f"Invalid jog axis: {axis!r}")
+                return
 
-        try:
-            value = float(value_str)
+            try:
+                value = float(value_str)
+            except ValueError:
+                self.logger.error(f"Invalid position value: {value_str!r}")
+                return
+
+            # Never forward a target outside the machine, whatever the console
+            # sent (corrupted line, stale limits after a console reboot, ...)
+            min_val, max_val = self.machine_limits[axis]
+            if not (min_val <= value <= max_val):
+                clamped = min(max(value, min_val), max_val)
+                self.logger.warning(f"Jog target {axis}{value} outside [{min_val}, {max_val}], "
+                                    f"clamped to {clamped}")
+                value = clamped
 
             # Forward to FluidNC as jog command
             jog_feedrate = self.config['machine']['jog_feedrate']
             self.fluidnc.jog(axis, value, jog_feedrate)
-
-            # Update internal state
-            self.current_pos[axis] = value
-
-        except ValueError:
-            self.logger.error(f"Invalid position value: {value_str}")
 
     def _on_axis(self, axis: str, action: str, *extra):
         """
@@ -641,6 +730,10 @@ class StateMachine:
         Args:
             status: Status dict with 'state' and 'position' keys
         """
+        if status.get('state') in ('Alarm', 'Critical') and self.state in self.HOMED_STATES:
+            # Backup for a missed alarm message
+            self._position_lost("FluidNC reports Alarm state")
+
         if 'position' in status:
             pos = status['position']
             # Update internal position
@@ -651,6 +744,49 @@ class StateMachine:
                 self.console.set_position('X', pos['X'])
                 self.console.set_position('Y', pos['Y'])
                 self.console.set_position('Z', pos['Z'])
+
+    def _on_fluidnc_alarm(self, text: str):
+        """FluidNC raised an alarm (hard/soft limit, reset in motion, ...)."""
+        if self.state == self.STATE_HOMING:
+            return  # The homing thread evaluates the outcome itself
+        if self.state in self.HOMED_STATES:
+            self._position_lost(f"FluidNC alarm: {text}")
+
+    def _on_fluidnc_unexpected_reset(self):
+        """FluidNC rebooted or was reset by someone else."""
+        if self.state == self.STATE_HOMING:
+            return
+        self._position_lost("FluidNC restarted unexpectedly")
+
+    def _position_lost(self, reason: str):
+        """The machine position can no longer be trusted: stop and re-home.
+
+        Called from the FluidNC read thread, so the actual work runs in a
+        separate thread (it needs the read thread to talk to FluidNC).
+        """
+        with self._lock:
+            if self._position_lost_pending:
+                return
+            self._position_lost_pending = True
+        self.logger.error(f"Machine position lost: {reason} - homing required")
+        threading.Thread(target=self._handle_position_lost, daemon=True).start()
+
+    def _handle_position_lost(self):
+        with self._lock:
+            handler = self.external_handler
+            self.external_handler = None
+            self.active_external_button = None
+            self.homed = False
+            self.point_B = None
+            self.point_C = None
+        if handler:
+            try:
+                handler.interrupt()
+            except Exception as e:
+                self.logger.error(f"Error interrupting external program: {e}")
+        with self._lock:
+            if self.state != self.STATE_HOMING:
+                self._transition_locked(self.STATE_NOT_HOMED)
 
     def _error_blink_all(self):
         """Blink all LEDs to indicate error."""
