@@ -1,0 +1,225 @@
+# AlphaPaint
+
+Guidance for Claude Code (and humans) working on this repository.
+
+AlphaPaint is a pen plotter: a Raspberry Pi 5 ("davinci") runs a daemon that
+connects a hand-built control console (ESP32) to a FluidNC motion controller
+(ESP32). Drawings are produced by external programs that talk to the daemon
+over a JSON protocol.
+
+**The machine moves.** Homing, jogging and drawing are physical motions that can
+crash the gantry into the pen holder. Never start motion (`$H`, `$J`, G-code,
+pressing buttons for the user) without the user explicitly asking for it.
+Stopping the daemon takes the machine out of service - say so.
+
+## Hardware
+
+| Part | Details |
+|---|---|
+| Machine | CoreXY, roughly 1 m x 1 m, `max_travel_mm: 955` on X and Y |
+| Motion controller | ESP32 running FluidNC v3.0.x, built from `~/FluidNC` (a fork, not upstream) |
+| Motors | 2x TMC2209 over UART2, 20 steps/mm, 4 microsteps, 1.5 A run / 0.3 A hold |
+| Pen (Z) | RC servo on gpio.12, `max_travel_mm: 60`; Z=60 is up, Z=0 is down |
+| Homing | Physical switches: X on gpio.22, Y on gpio.21, both active high with pull-down. Home is X=0, Y=0, Z=60; X and Y home towards 0 |
+| Pen changer | 5 slots at X = 700 + 34*index, Y = 12, Z = 13. **Stands on the right; the gantry can crash into it and no endstop is hit there** |
+| Console | ESP32, TM1637 displays, PCF-style I2C LED expander, handwheel via PCNT, buttons A-G + X/Y/Z |
+
+Both USB adapters are CP2102 chips **with the same serial number**, so
+`/dev/serial/by-id` holds only one of them and `ttyUSB0`/`ttyUSB1` swap between
+boots. Always identify by probing (see "Talking to the boards directly").
+
+## Layout
+
+```
+~/AlphaPaint/Software/
+  Daemon/           Python daemon (runs in place from this checkout)
+    daemon.py       Entry point: port scan, device identification, reconnects
+    config.yaml     Live config (config.dev.yaml takes precedence if present)
+    venv/           Its virtualenv (git-ignored); the systemd unit uses it
+    lib/
+      fluidnc.py          Serial protocol, flow control, homing, status, alarms
+      console.py          Console protocol (TYPE:ARG:ARG lines)
+      state_machine.py    States, buttons, canvas, external programs
+      external_program.py JSON API for drawing programs; coordinate transforms
+      position_tracer.py  Expected vs reported position, CSV trace, warnings
+      drawing.py          Line/ellipse helpers (legacy, buttons now run programs)
+    tools/analyze_position_trace.py   Post-mortem analysis of the CSV trace
+  Console/          ESP-IDF project for the console firmware (main/console.c)
+  Programs/         Drawing programs + the client library
+    alphapaint.py   Client library: canvas/machine moves, pen, pen changer
+    alphapreview.py Offline preview backend (no machine)
+    pentest.py      Button F: grid of crosses/squares/circles, uses pen changer
+    ekster.py       Button G: scribble drawing from ekster.png, uses pen changer
+    logo_runner.py  Button E: draws a .logo file (Examples/ROBOT.logo)
+~/FluidNC/          FluidNC fork actually flashed on the controller
+```
+
+## Architecture
+
+**Threads in the daemon** (this is where most bugs live):
+
+- main thread: port scanning, reconnect loop
+- console read thread: parses console lines, calls state-machine callbacks
+- FluidNC read thread: parses status reports, delivers `ok`/`error:`, calls the
+  status/alarm callbacks
+- homing thread: started per homing cycle
+- external-program threads: stdout reader (API calls) and stderr logger
+
+State changes go through `StateMachine._lock`. Callbacks that arrive on the
+FluidNC read thread must not call back into FluidNC synchronously (that would
+deadlock); `_position_lost()` spawns a thread for that reason.
+
+**States**: `STARTUP -> NOT_HOMED -> HOMING -> CANVAS_SETUP -> READY ->
+EXTERNAL_PROGRAM`, plus `ERROR`. Buttons: A homes (long press re-homes),
+B and C set the canvas corners, D sets pen-down Z, E/F/G start programs.
+
+**Console protocol** (line based, both directions):
+`BTN:A:SHORT`, `POS:X:12.34`, `AXIS:X:SELECT`, `STATUS:HOMED`, `ERROR:...` from
+the console; `MODE:ACTIVE|PASSIVE`, `LED:A:ON|OFF|BLINK|FAST_BLINK`,
+`POS:X:12.34`, `LIMIT:X:0.00:955.00`, `ID?` to the console. In ACTIVE mode the
+console is the position master: the handwheel sends absolute targets, which the
+daemon forwards as `$J=` jogs (clamped to the machine limits).
+
+**FluidNC protocol**: character-counted streaming (128-byte RX buffer), `ok` per
+line, auto status reports at 10 Hz (`$Report/Interval=100`, `$10=3` for MPos and
+buffer). `ok` means "planned", **not** "executed" - use `G4 P0` to synchronize.
+
+**External program API** (JSON lines on stdin/stdout, see `external_program.py`):
+`query_machine`, `query_canvas`, `query_position`, `pen_up`, `pen_up_fast`,
+`pen_down`, `move_to`, `draw_to`, `draw_arc`, the `canvas_*` and `normalized_*`
+variants, `set_feedrate`, `rehome_y`, `flush`, `done`. Programs are killed with
+an `interrupted` event; a rejected move raises in the program.
+
+## Operating
+
+```bash
+systemctl status alphapaint-daemon          # state
+sudo systemctl restart alphapaint-daemon    # restart (machine goes to NOT_HOMED)
+sudo systemctl stop alphapaint-daemon       # required before touching the ports
+journalctl -u alphapaint-daemon -f          # live log
+tail -f /var/log/alphapaint-daemon.log      # same log, file copy
+```
+
+The unit is `/etc/systemd/system/alphapaint-daemon.service` and runs the daemon
+**in place** from this checkout with `Software/Daemon/venv/bin/python`.
+`Software/Daemon/install.sh` re-creates that setup; it deliberately does not
+copy files anywhere (an old copy in `~/alphapaint` used to be the live code).
+
+Logs: `/var/log/alphapaint-daemon.log` and the position trace
+`/var/log/alphapaint-position-trace.csv`, both rotated by
+`/etc/logrotate.d/alphapaint` with `copytruncate` (the daemon keeps them open).
+The `max_size`/`backup_count` keys in `config.yaml` are not implemented.
+
+Analyze a trace: `Software/Daemon/venv/bin/python
+Software/Daemon/tools/analyze_position_trace.py /var/log/alphapaint-position-trace.csv`.
+
+## Talking to the boards directly
+
+Stop the daemon first, then identify the ports (they swap):
+
+```python
+# $I -> "[VER:3.0 FluidNC ...]" means FluidNC; "ERROR:UNKNOWN_CMD" or
+# "CONSOLE:ALPHAPAINT:V1.2" (answer to ID?) means the console.
+import serial, time
+s = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.2)
+s.write(b'$I\n'); time.sleep(1); print(s.read(4096).decode(errors='replace'))
+```
+
+Useful FluidNC commands: `$I` version, `?` status (realtime, **no newline**),
+`$CD` dump the running config, `$LocalFS/Show=config.yaml`, `$SS` startup log,
+`$Limits` (interactive, leave with `!`). Do not send `$X`: it declares all axes
+homed again, which is exactly the safety net we want to keep.
+
+Reading a status line while the board reboots produces garbage - re-read before
+concluding anything is wrong.
+
+## Flashing
+
+**FluidNC** (`~/FluidNC`, PlatformIO in `~/.pio-venv`):
+
+```bash
+sudo systemctl stop alphapaint-daemon
+cd ~/FluidNC
+~/.pio-venv/bin/pio run -e wifi                                      # build
+~/.pio-venv/bin/pio run -e wifi -t upload   --upload-port /dev/ttyUSB0   # firmware
+~/.pio-venv/bin/pio run -e wifi -t uploadfs --upload-port /dev/ttyUSB0   # config.yaml
+sudo systemctl start alphapaint-daemon
+```
+
+- `platformio_override.ini` (git-ignored) pins `upload_speed = 230400`. The
+  CP2102 adapters fail at 460800 and 921600 ("Packet content transfer stopped").
+- `uploadfs` writes `FluidNC/data/` (config.yaml, favicon.ico, index.html.gz) -
+  the same three files the controller holds, so nothing else is lost.
+- Run flashing in the background (`run_in_background`); an interrupted write
+  leaves the controller without working firmware until it is redone.
+- The machine config lives in `FluidNC/data/config.yaml` **in git**; keep it in
+  sync with the controller (`$CD` shows what is actually loaded).
+
+**Console** (ESP-IDF 5.2 in `~/esp/esp-idf`):
+
+```bash
+cd ~/AlphaPaint/Software/Console
+. ~/esp/esp-idf/export.sh
+idf.py build
+idf.py -p /dev/ttyUSB1 -b 230400 flash
+```
+
+The FluidNC repo has no git identity configured; commit there with
+`git -c user.name=Tom-Michiels -c user.email=96994937+Tom-Michiels@users.noreply.github.com`.
+
+## Testing without the machine
+
+Most of the serial layer can be tested against a fake FluidNC on a pty: open
+`pty.openpty()`, answer `?` with `<Idle|MPos:...|Bf:15,128>`, `ok` per line,
+a `Grbl 3.0 [...]` banner on `\x18`, and point `FluidNCHandler` at
+`os.ttyname(slave)`. That is how the homing verification, the feed-hold stop,
+concurrent `send_gcode` calls and the alarm/reboot detection were verified.
+`alphapreview.py` renders a program's output without a machine.
+
+## The open problem: sudden loss of position
+
+**Symptom** (from the user): the plotter is accurate for a long time, then in
+one go it draws completely beside the paper, after roughly five minutes of
+drawing. It also drives far into Y-negative and crashes into the pen holder on
+the right, where no endstop is hit. It is *not* gradual step loss, and the
+plotter lies flat (gravity plays no role).
+
+Because every move is absolute, a single wrong command cannot explain it: the
+next move would come back to the right place. So the link between FluidNC's
+computed position and the physical machine breaks in one event (mechanical slip
+or a driver dropping out), or a move in a sequence silently did not happen.
+
+Evidence found in the logs (January - June), all addressed:
+
+- 448x `error:33`: arcs rejected because coordinates were rounded to 2 decimals;
+  one rejected arc shifts the start of the next one, so they cascade.
+- 9710 orphaned `ok`s, hundreds of "recovered" (invented) `ok`s and stale
+  timeouts: the ok/command bookkeeping desynchronized while the machine was busy.
+- Six homing cycles ran the full 1050.5 mm seek (1.1 x 955) without seeing the X
+  switch, grinding into the frame, and the daemon still reported "Homing
+  complete". Always preceded by a Ctrl-X sent during motion.
+- Rejected moves returned `success: False`, which the programs ignored and
+  continued as if the move had happened.
+
+What is in place now (2026-09-19): verified homing, feed hold before every
+reset, alarm/reboot detection, arc validation, clamped jogs, a position check
+before entering a pen slot, TMC driver fault logging, and SpreadCycle instead of
+StealthChop on X/Y. `hold_amps` stays 0.3 (the user confirmed holding torque is
+not the issue) and automatic Y re-homing during programs is available but
+**disabled** (`REHOME_Y_EVERY_N_PEN_CHANGES = 0` in `alphapaint.py`) because it
+moves Y to 0 and the pen holder's clearance has not been confirmed.
+
+Still unproven: the root cause of the one-shot offset. Next time it happens,
+collect `journalctl -u alphapaint-daemon` and the CSV trace and look for
+`driver fault` (over-temperature or short - electrical), `FluidNC alarm`, or
+neither (then suspect belts/pulley grub screws).
+
+## Conventions
+
+- Comments and commit messages in English; the user writes Dutch, answer in Dutch.
+- Do not change `hold_amps`, feed rates or accelerations without asking: the
+  user knows this machine's mechanics better than the logs show.
+- Position consumers must never see an invented position; `_parse_status`
+  returns `None` for a truncated report rather than `(0,0,0)`.
+- Prefer `feed hold -> wait for standstill -> Ctrl-X` over a bare soft reset:
+  a reset during motion makes FluidNC lose its position.
