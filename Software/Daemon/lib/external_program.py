@@ -407,13 +407,24 @@ class ExternalProgramHandler:
                 return False, f"Z position {z} out of bounds [{min_z}, {max_z}]"
         return True, None
 
-    def _get_current_position(self) -> Dict[str, float]:
+    def _get_current_position(self, fresh: bool = False) -> Dict[str, float]:
         """Get current machine position from auto-report cache.
 
         Uses cached position from auto-report to avoid disrupting the serial
         command/response stream. Falls back to explicit query only when
         no cached position exists.
+
+        Args:
+            fresh: Query FluidNC directly. The cache can lag one report
+                   (100 ms, several mm while moving), which is too stale to
+                   decide whether a finished move really reached its target.
         """
+        if fresh:
+            status = self.fluidnc.get_status()
+            if status and 'position' in status:
+                return status['position']
+            self.logger.warning("Fresh status query failed, using cached position")
+
         cached = self.fluidnc.get_cached_status(max_age=1.0)
         if cached and 'position' in cached:
             return cached['position']
@@ -762,7 +773,9 @@ class ExternalProgramHandler:
         # before returning "ok"
         success = self.fluidnc.send_gcode("G4 P0", wait_ok=True, timeout=60.0)
 
-        pos = self._get_current_position()
+        # Fresh: the dwell guarantees the motion finished, but the cached
+        # auto-report can still be from just before the machine stopped.
+        pos = self._get_current_position(fresh=True)
         return {
             'success': success,
             'position': {'x': pos['X'], 'y': pos['Y'], 'z': pos['Z']}

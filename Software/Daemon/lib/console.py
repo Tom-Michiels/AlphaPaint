@@ -307,6 +307,32 @@ class ConsoleHandler:
         if not self.serial or not self.serial.is_open:
             return False
 
+        if self._identify_once():
+            return True
+
+        # No answer at all: the ESP32 can be stuck in download mode (its
+        # boot pin is also button B, and the serial control lines drive
+        # reset). Reset it into its application and ask once more.
+        self.logger.info("No answer from console, resetting it and retrying")
+        if not self._reset_into_application():
+            return False
+        return self._identify_once()
+
+    def _reset_into_application(self) -> bool:
+        """Pulse the reset line with the boot pin high (normal boot)."""
+        try:
+            self.serial.dtr = False   # IO0 high: run the application
+            self.serial.rts = True    # EN low: hold in reset
+            time.sleep(0.1)
+            self.serial.rts = False   # release reset
+            time.sleep(1.5)           # let it boot
+            self.serial.reset_input_buffer()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error resetting Console: {e}")
+            return False
+
+    def _identify_once(self) -> bool:
         try:
             # Clear input buffer
             self.serial.reset_input_buffer()
