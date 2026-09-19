@@ -12,6 +12,15 @@ machine:
   pen_lift_feedrate: 10000  # Pen Z movement speed (mm/min)
   # Note: Safe Z height is dynamically read from machine_limits['Z'][1]
 
+# Override FluidNC axis limits at every daemon start (sent via $ commands).
+# Uncomment entries to override; otherwise the controller's own values are used
+# (X/Y: 10000 mm/min, 500 mm/sec²; Z: 3000 mm/min, 500 mm/sec²).
+#motion_limits:
+#  x_max_rate: 6000          # $110 mm/min
+#  y_max_rate: 6000          # $111 mm/min
+#  x_acceleration: 250       # $120 mm/sec²
+#  y_acceleration: 250       # $121 mm/sec²
+
 drawing:
   ellipse_segments: 36      # Number of segments for ellipse approximation
   min_position_delta: 0.01  # Minimum position change to send jog (mm)
@@ -25,6 +34,11 @@ logging:
 debugging:
   enable_console_echo: false  # Echo Console messages to log
   enable_fluidnc_echo: false  # Echo FluidNC messages to log
+  # Position tracer: writes one CSV row per status sample (~10 Hz) plus
+  # event rows for state changes, soft resets, etc. Comment out to disable
+  # CSV output (event-level WARNINGs in the main log stay enabled either way).
+  # Analyze afterwards with tools/analyze_position_trace.py.
+  position_trace_file: /var/log/alphapaint-position-trace.csv
 
 # External drawing programs configuration
 # These programs are triggered by buttons E, F, G when enabled.

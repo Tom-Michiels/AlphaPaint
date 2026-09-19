@@ -22,11 +22,15 @@ The AlphaPaint daemon runs on the Raspberry Pi and coordinates communication bet
 - Python 3.7 or higher
 - Two USB serial devices (Console and FluidNC)
 
-### Install Dependencies
+### Install
+
+The daemon runs in place from the git checkout (`AlphaPaint/Software/Daemon`);
+nothing is copied elsewhere. `install.sh` creates `venv/` here and installs the
+systemd service pointing at this directory:
 
 ```bash
-cd /home/pi/alphapaint
-pip3 install -r requirements.txt
+cd ~/AlphaPaint/Software/Daemon
+./install.sh
 ```
 
 ### Configuration
@@ -53,8 +57,8 @@ logging:
 ### Manual Start
 
 ```bash
-cd /home/pi/alphapaint
-python3 daemon.py config.yaml
+cd ~/AlphaPaint/Software/Daemon
+venv/bin/python daemon.py config.yaml
 ```
 
 ### Auto-Start on Boot (systemd)

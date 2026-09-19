@@ -9,6 +9,8 @@ import collections
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Tuple, Callable
 
+from .position_tracer import PositionTracer
+
 
 @dataclass
 class PendingCommand:
@@ -24,7 +26,8 @@ class PendingCommand:
 class FluidNCHandler:
     """Handles communication with FluidNC CNC controller."""
 
-    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0):
+    def __init__(self, port: str, baudrate: int = 115200, timeout: float = 1.0,
+                 trace_file: Optional[str] = None):
         """
         Initialize FluidNC handler.
 
@@ -32,10 +35,13 @@ class FluidNCHandler:
             port: Serial port path (e.g., /dev/ttyUSB1)
             baudrate: Serial baudrate (default: 115200)
             timeout: Serial timeout in seconds
+            trace_file: Optional path for the position-tracer CSV. If None,
+                        only event-level warnings are logged (no CSV).
         """
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self.tracer = PositionTracer(trace_file=trace_file)
         self.serial: Optional[serial.Serial] = None
         self.logger = logging.getLogger(__name__)
         self._serial_lock = threading.Lock()  # Protects all serial operations
@@ -109,6 +115,7 @@ class FluidNCHandler:
 
             # Full reset sequence to clear any stuck state
             self.serial.write(b'\x18')  # Ctrl-X soft reset
+            self.tracer.note_soft_reset()
             self.logger.info("Soft reset sent to clear any stuck state")
             time.sleep(2.0)  # Wait for reset to complete
             self.serial.reset_input_buffer()  # Clear startup messages
@@ -135,6 +142,60 @@ class FluidNCHandler:
         if self.serial and self.serial.is_open:
             self.serial.close()
             self.logger.info("Disconnected from FluidNC")
+        self.tracer.close()
+
+    def apply_motion_limits(self, limits: Dict[str, float]) -> bool:
+        """
+        Override axis max-rate / acceleration via Grbl-style $ settings.
+
+        Must be called after connect() and before start() (the read thread
+        must not be running, since this reads 'ok' directly off the port).
+
+        Args:
+            limits: dict with any of x_max_rate, y_max_rate, z_max_rate,
+                    x_acceleration, y_acceleration, z_acceleration
+
+        Returns:
+            True if every requested setting was acked with 'ok'.
+        """
+        if not self.serial or not self.serial.is_open:
+            self.logger.warning("Cannot apply motion limits: not connected")
+            return False
+
+        # FluidNC v3 rejects the legacy $110/$120 form (error:162) for
+        # axis settings - we have to use the YAML-path form.
+        key_to_setting = {
+            'x_max_rate': '$axes/x/max_rate_mm_per_min',
+            'y_max_rate': '$axes/y/max_rate_mm_per_min',
+            'z_max_rate': '$axes/z/max_rate_mm_per_min',
+            'x_acceleration': '$axes/x/acceleration_mm_per_sec2',
+            'y_acceleration': '$axes/y/acceleration_mm_per_sec2',
+            'z_acceleration': '$axes/z/acceleration_mm_per_sec2',
+        }
+
+        all_ok = True
+        with self._serial_lock:
+            for key, setting in key_to_setting.items():
+                if key not in limits:
+                    continue
+                value = limits[key]
+                self._send_unlocked(f"{setting}={value}")
+                deadline = time.time() + 2.0
+                acked = False
+                while time.time() < deadline:
+                    line = self._readline_unlocked(timeout=0.1)
+                    if line and line.startswith('ok'):
+                        acked = True
+                        break
+                    if line and (line.startswith('error') or line.startswith('ALARM')):
+                        self.logger.error(f"FluidNC rejected {setting}={value}: {line}")
+                        break
+                if acked:
+                    self.logger.info(f"Applied motion limit {setting}={value} ({key})")
+                else:
+                    self.logger.warning(f"No 'ok' for {setting}={value}")
+                    all_ok = False
+        return all_ok
 
     def start(self):
         """Start background read thread for continuous status updates."""
@@ -298,6 +359,17 @@ class FluidNCHandler:
         if deltas.get('ok_orphaned', 0) > 0:
             problems.append(f"orphans={deltas['ok_orphaned']}")
 
+        # Pull tracer deltas as well, so position issues surface in the
+        # same heartbeat line as serial issues.
+        tracer_stats = self.tracer.get_stats()
+        tracer_snap = getattr(self, '_tracer_snapshot', {})
+        for key in ('end_of_motion_mismatches', 'idle_drifts',
+                    'alarm_events', 'soft_resets', 'unlocks', 'wcs_changes'):
+            d = tracer_stats.get(key, 0) - tracer_snap.get(key, 0)
+            if d > 0:
+                problems.append(f"{key}={d}")
+        self._tracer_snapshot = dict(tracer_stats)
+
         # Save snapshot for next delta
         self._stats_snapshot = dict(self._stats)
 
@@ -460,6 +532,11 @@ class FluidNCHandler:
                     self._cached_position_time = time.time()
                 if 'state' in status:
                     self._cached_state = status['state']
+
+                # Feed the position tracer (records sample, detects
+                # discontinuities, logs state transitions).
+                self.tracer.note_status(status.get('state'),
+                                        status.get('position'))
 
                 # Sync buffer tracking with real FluidNC buffer state
                 if 'buffer' in status:
@@ -634,6 +711,7 @@ class FluidNCHandler:
         try:
             self.serial.write(command.encode('utf-8'))
             self.logger.debug(f"FluidNC TX: {command.strip()}")
+            self.tracer.note_outgoing(command.strip())
             return True
         except Exception as e:
             self.logger.error(f"Failed to send to FluidNC: {e}")
@@ -1098,6 +1176,7 @@ class FluidNCHandler:
                 if self.serial and self.serial.is_open:
                     self.serial.write(b'\x18')
                     self.logger.info("Soft reset sent")
+                    self.tracer.note_soft_reset()
                     time.sleep(0.3)  # Wait for reset (FluidNC resets within ~100ms)
 
                     # Clear all pending commands with reset error

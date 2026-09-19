@@ -21,33 +21,26 @@ fi
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Installation directory
-INSTALL_DIR="/home/$USER/alphapaint"
+# The daemon runs in place from this git checkout - nothing is copied elsewhere.
+DAEMON_DIR="$SCRIPT_DIR"
 
-echo "Installing from: $SCRIPT_DIR"
-echo "Installing to: $INSTALL_DIR"
+echo "Installing from: $DAEMON_DIR (runs in place)"
 echo ""
 
-# Create installation directory
-echo "[1/6] Creating installation directory..."
-mkdir -p "$INSTALL_DIR"
-
-# Copy files (clean old lib first to remove stale modules/pycache)
-echo "[2/6] Copying daemon files..."
-rm -rf "$INSTALL_DIR/lib"
-cp -r "$SCRIPT_DIR/lib" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/daemon.py" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/config.yaml" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/alphapaint-daemon.service" "$INSTALL_DIR/"
+# Warn about the legacy copy-based install location if present
+echo "[1/6] Checking for legacy install..."
+if [ -d "/home/$USER/alphapaint" ]; then
+    echo "NOTE: legacy copy /home/$USER/alphapaint exists and is no longer used; you can remove it."
+fi
 
 # Make daemon executable
-chmod +x "$INSTALL_DIR/daemon.py"
+echo "[2/6] Making daemon executable..."
+chmod +x "$DAEMON_DIR/daemon.py"
 
 # Create virtual environment and install Python dependencies
 echo "[3/6] Creating virtual environment and installing dependencies..."
-python3 -m venv "$INSTALL_DIR/venv"
-"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
+python3 -m venv "$DAEMON_DIR/venv"
+"$DAEMON_DIR/venv/bin/pip" install -r "$DAEMON_DIR/requirements.txt"
 
 # Add user to dialout group for serial port access
 echo "[4/6] Setting up serial port permissions..."
@@ -67,10 +60,10 @@ sudo chown $USER:$USER /var/log/alphapaint-daemon.log
 echo "[6/6] Installing systemd service..."
 
 # Update service file with actual user and paths
-sudo cp "$INSTALL_DIR/alphapaint-daemon.service" /etc/systemd/system/
+sudo cp "$DAEMON_DIR/alphapaint-daemon.service" /etc/systemd/system/
 sudo sed -i "s|User=pi|User=$USER|g" /etc/systemd/system/alphapaint-daemon.service
 sudo sed -i "s|Group=pi|Group=$USER|g" /etc/systemd/system/alphapaint-daemon.service
-sudo sed -i "s|/home/pi/alphapaint|$INSTALL_DIR|g" /etc/systemd/system/alphapaint-daemon.service
+sudo sed -i "s|/home/pi/AlphaPaint/Software/Daemon|$DAEMON_DIR|g" /etc/systemd/system/alphapaint-daemon.service
 
 # Reload systemd
 sudo systemctl daemon-reload
@@ -83,7 +76,7 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "1. Review and edit configuration (optional):"
-echo "   nano $INSTALL_DIR/config.yaml"
+echo "   nano $DAEMON_DIR/config.yaml"
 echo ""
 echo "2. Enable daemon to start on boot:"
 echo "   sudo systemctl enable alphapaint-daemon"

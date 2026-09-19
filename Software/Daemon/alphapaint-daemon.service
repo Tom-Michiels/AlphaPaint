@@ -1,14 +1,14 @@
 [Unit]
 Description=AlphaPaint Daemon
 After=network.target
-Documentation=https://github.com/yourusername/alphapaint
+Documentation=https://github.com/Tom-Michiels/AlphaPaint
 
 [Service]
 Type=simple
 User=pi
 Group=pi
-WorkingDirectory=/home/pi/alphapaint
-ExecStart=/home/pi/alphapaint/venv/bin/python /home/pi/alphapaint/daemon.py /home/pi/alphapaint/config.yaml
+WorkingDirectory=/home/pi/AlphaPaint/Software/Daemon
+ExecStart=/home/pi/AlphaPaint/Software/Daemon/venv/bin/python /home/pi/AlphaPaint/Software/Daemon/daemon.py /home/pi/AlphaPaint/Software/Daemon/config.yaml
 Restart=always
 RestartSec=5
 

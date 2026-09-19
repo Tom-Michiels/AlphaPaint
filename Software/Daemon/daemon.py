@@ -328,7 +328,8 @@ class AlphaPaintDaemon:
             self.fluidnc = FluidNCHandler(
                 self._fluidnc_port,
                 self.config['serial']['baud_rate'],
-                self.config['serial']['timeout']
+                self.config['serial']['timeout'],
+                trace_file=self.config.get('debugging', {}).get('position_trace_file')
             )
             if not self.fluidnc.connect():
                 self.logger.error("Failed to reconnect to FluidNC")
@@ -407,13 +408,18 @@ class AlphaPaintDaemon:
                 self.fluidnc = FluidNCHandler(
                     fluidnc_port,
                     self.config['serial']['baud_rate'],
-                    self.config['serial']['timeout']
+                    self.config['serial']['timeout'],
+                    trace_file=self.config.get('debugging', {}).get('position_trace_file')
                 )
                 if not self.fluidnc.connect():
                     self.logger.error("Failed to connect to FluidNC")
                     self.console.disconnect()
                     time.sleep(self.config['serial']['reconnect_delay'])
                     continue
+
+                motion_limits = self.config.get('motion_limits') or {}
+                if motion_limits:
+                    self.fluidnc.apply_motion_limits(motion_limits)
 
                 # Create state machine
                 self.state_machine = StateMachine(

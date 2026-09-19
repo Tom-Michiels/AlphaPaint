@@ -37,3 +37,7 @@ dependencies.lock
 *.tmp
 *.bak
 *.log
+
+# Virtual environments
+venv/
+.venv/
