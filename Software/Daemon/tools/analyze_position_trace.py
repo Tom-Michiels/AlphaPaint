@@ -26,6 +26,12 @@ from collections import Counter
 from pathlib import Path
 
 DEFAULT_PATH = '/var/log/alphapaint-position-trace.csv'
+# Must match the header written by lib/position_tracer.py. Needed because
+# logrotate (copytruncate) leaves the live file without a header line.
+FIELDNAMES = ['iso_time', 'mono', 'seq', 'kind', 'state',
+              'mpos_x', 'mpos_y', 'mpos_z',
+              'exp_x', 'exp_y', 'exp_z',
+              'delta_xy', 'delta_z', 'event', 'last_cmd']
 
 EVENT_KINDS = {'STATE', 'SOFT_RESET', 'UNLOCK', 'WCS', 'MODE',
                'IDLE_DRIFT', 'END_MISMATCH', 'CMD', 'INIT'}
@@ -34,7 +40,9 @@ EVENT_KINDS = {'STATE', 'SOFT_RESET', 'UNLOCK', 'WCS', 'MODE',
 def load_rows(path, tail=None, since=None):
     rows = []
     with open(path, newline='') as f:
-        reader = csv.DictReader(f)
+        has_header = f.readline().startswith('iso_time,')
+        f.seek(0)
+        reader = csv.DictReader(f, fieldnames=None if has_header else FIELDNAMES)
         for row in reader:
             if since and row.get('iso_time', '') < since:
                 continue
