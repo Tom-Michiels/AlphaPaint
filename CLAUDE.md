@@ -203,8 +203,10 @@ Evidence found in the logs (January - June), all addressed:
 
 What is in place now (2026-09-19): verified homing, feed hold before every
 reset, alarm/reboot detection, arc validation, clamped jogs, a position check
-before entering a pen slot, TMC driver fault logging, and SpreadCycle instead of
-StealthChop on X/Y. `hold_amps` stays 0.3 (the user confirmed holding torque is
+before entering a pen slot, and SpreadCycle instead of StealthChop on X/Y
+(`run_mode: CoolStep`). Driver fault logging was tried and reverted, see
+"Mistakes made here". Whether spreadCycle is really active is still unverified:
+check that both drivers report `GCONF: 0x1c4` at the next homing. `hold_amps` stays 0.3 (the user confirmed holding torque is
 not the issue) and automatic Y re-homing during programs is available but
 **disabled** (`REHOME_Y_EVERY_N_PEN_CHANGES = 0` in `alphapaint.py`) because it
 moves Y to 0 and the pen holder's clearance has not been confirmed.
@@ -213,6 +215,38 @@ Still unproven: the root cause of the one-shot offset. Next time it happens,
 collect `journalctl -u alphapaint-daemon` and the CSV trace and look for
 `driver fault` (over-temperature or short - electrical), `FluidNC alarm`, or
 neither (then suspect belts/pulley grub screws).
+
+## Mistakes made here - do not repeat them
+
+**Never read or write TMC registers from another task.** Both TMC2209s share
+one UART and TMCStepper is not thread safe. A "driver health poll" added on
+2026-09-19 read `DRV_STATUS` once a second from the stallguard timer task; it
+raced with register writes from the protocol task and a write was lost. One
+driver ended up with `GCONF 0x0`, so it took its microstep setting from the
+MS1/MS2 pins (which also select the UART address, and differ per driver)
+instead of from the register. The two motors then had different steps/mm and
+the CoreXY machine homed **diagonally**. Registers may only be touched from the
+code paths FluidNC already uses (config, `set_registers`, `set_disable`).
+
+How to check: FluidNC dumps the registers at each homing. Both drivers must
+show the same `GCONF`; `0x1c0` is StealthChop configured correctly, `0x1c4`
+adds spreadCycle (`run_mode: CoolStep`). `GCONF: 0x0` means the driver is
+unconfigured - stop and fix that first.
+
+```bash
+journalctl -u alphapaint-daemon --since "-10min" | grep -E 'GCONF|Homed'
+```
+
+**`ok` is not "executed", and the cached position lags.** A toolchanger safety
+check compared the expected position with `_get_current_position()`, which
+returns the cached auto-report (up to one 100 ms report old, several mm while
+moving). It aborted a pen pickup at X=701.05 while the machine reached exactly
+X=700.00 64 ms later. Synchronize with `G4 P0` **and** query a fresh status
+(`_get_current_position(fresh=True)`) before judging a position.
+
+**Verify a regression against the historical logs before blaming the machine.**
+The `GCONF 0x0` was obvious once compared with `/var/log/alphapaint-daemon.log.1`,
+where every historical reading was `0x1c0`.
 
 ## Conventions
 
