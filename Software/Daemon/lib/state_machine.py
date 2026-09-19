@@ -347,6 +347,7 @@ class StateMachine:
 
     def _homing_failed(self, reason: str):
         self.logger.error(f"Homing failed: {reason}")
+        self._log_motor_status()
         with self._lock:
             self.homed = False
             self._transition_locked(self.STATE_ERROR)
@@ -775,7 +776,15 @@ class StateMachine:
         self.logger.error(f"Machine position lost: {reason} - homing required")
         threading.Thread(target=self._handle_position_lost, daemon=True).start()
 
+    def _log_motor_status(self):
+        """Capture the driver flags while the fault is still fresh."""
+        try:
+            self.fluidnc.report_motor_status()
+        except Exception as e:
+            self.logger.debug(f"Could not read motor status: {e}")
+
     def _handle_position_lost(self):
+        self._log_motor_status()
         with self._lock:
             handler = self.external_handler
             self.external_handler = None

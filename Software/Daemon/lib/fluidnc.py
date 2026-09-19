@@ -1097,6 +1097,14 @@ class FluidNCHandler:
             self.logger.error(f"Homing did not finish within {timeout:.0f}s")
             return False
 
+    def report_motor_status(self) -> bool:
+        """Ask FluidNC to log the driver status ($MS) of every motor.
+
+        Allowed in any state, so it also works right after an alarm. The
+        answer arrives as [MSG:INFO: ...] lines in the log.
+        """
+        return self.send_gcode("$MS", wait_ok=True, timeout=10.0)
+
     def init_motors(self) -> bool:
         """Re-apply the driver configuration ($MI, allowed when Idle/Alarm).
 
