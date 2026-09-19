@@ -220,6 +220,10 @@ class AlphaPaint:
 
     def return_pen(self, pen_index: int) -> None:
         """Return pen to toolchanger slot (0-indexed)."""
+        if REHOME_Y_EVERY_N_PEN_CHANGES:
+            # Measuring here as well as before the pickup splits the drift
+            # into "during drawing" and "during the pen change itself".
+            self.rehome_y()
         pen_x, pen_y, pen_z = self._get_pen_position(pen_index)
 
         # Snel naar positie boven pen
