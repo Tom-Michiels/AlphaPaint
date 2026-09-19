@@ -211,7 +211,16 @@ not the issue) and automatic Y re-homing during programs is available but
 **disabled** (`REHOME_Y_EVERY_N_PEN_CHANGES = 0` in `alphapaint.py`) because it
 moves Y to 0 and the pen holder's clearance has not been confirmed.
 
-Still unproven: the root cause of the one-shot offset. Next time it happens,
+**Root cause found (2026-09-20).** `tools/motor_stall_test.py` reproduced it in
+90 seconds: at `run_amps: 1.5` the X driver reaches its 143 C thermal shutdown
+(`temp_shutdown:Y` in the `$MS` output) and that motor stops turning. On CoreXY
+a Y move then runs diagonally - Tom saw the gantry go (+1,-1) instead of (0,-1),
+which means the X+Y motor stood still - and the machine loses its position in
+one go. At 1.0 A there is no thermal event but the motors lose steps from lack
+of torque (about 10 mm per two minutes of sweeping). So the drivers need
+cooling; `tools/current_sweep.py` measures where the usable window is.
+
+Older notes, now superseded: Next time it happens,
 collect `journalctl -u alphapaint-daemon` and the CSV trace and look for
 `driver fault` (over-temperature or short - electrical), `FluidNC alarm`, or
 neither (then suspect belts/pulley grub screws).
