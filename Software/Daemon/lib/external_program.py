@@ -740,17 +740,44 @@ class ExternalProgramHandler:
         self._send_motion(f"G0 X{safe_x:.3f}", wait=True)
         # Wait until the move has really finished before homing
         self._send_motion("G4 P0", wait=True)
-        before = self._get_current_position()
+        before = self._get_current_position(fresh=True)
 
-        if not self.fluidnc.send_gcode("$HY", wait_ok=True, timeout=90.0):
+        # While homing, MPos keeps counting down in the old coordinate system.
+        # The lowest value reached is where the switch actually tripped, so it
+        # is how far the machine had drifted (positive = it sat lower than
+        # FluidNC thought). Resolution is one status report, a few mm.
+        drift_samples = []
+
+        def sample_during_homing():
+            while not homing_done.is_set():
+                status = self.fluidnc.get_cached_status(max_age=0.5)
+                if status and status.get('state') in ('Home', 'Homing'):
+                    drift_samples.append(status['position']['Y'])
+                time.sleep(0.03)
+
+        homing_done = threading.Event()
+        sampler = threading.Thread(target=sample_during_homing, daemon=True)
+        sampler.start()
+        try:
+            homed = self.fluidnc.send_gcode("$HY", wait_ok=True, timeout=90.0)
+        finally:
+            homing_done.set()
+            sampler.join(timeout=1.0)
+        if not homed:
             raise RuntimeError("Y re-homing failed")
+        drift = min(drift_samples) if drift_samples else None
         self.fluidnc.send_gcode("G4 P0", wait_ok=True, timeout=10.0)
         status = self.fluidnc.get_status()
         if (not status or status['state'] != 'Idle'
                 or abs(status['position']['Y'] - home_y) > 0.5):
             raise RuntimeError(f"Y re-homing not verified (status={status})")
-        self.logger.info(f"Y re-homed (Y was {before['Y']:.3f} before re-homing)")
-        return {'success': True, 'position': {
+        if drift is None:
+            self.logger.info(f"Y re-homed (Y was {before['Y']:.3f} before re-homing)")
+        else:
+            self.logger.info(f"Y re-homed: drift {drift:+.1f}mm "
+                             f"(switch tripped at Y={drift:.1f} instead of 0; "
+                             f"Y was {before['Y']:.3f} before re-homing)")
+        return {'success': True, 'drift_mm': drift, 'position': {
             'x': status['position']['X'], 'y': status['position']['Y'],
             'z': status['position']['Z']}}
 

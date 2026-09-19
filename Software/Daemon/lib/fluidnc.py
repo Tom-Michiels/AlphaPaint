@@ -1097,6 +1097,16 @@ class FluidNCHandler:
             self.logger.error(f"Homing did not finish within {timeout:.0f}s")
             return False
 
+    def init_motors(self) -> bool:
+        """Re-apply the driver configuration ($MI, allowed when Idle/Alarm).
+
+        A stepper driver that lost power (emergency stop) comes back with
+        default microsteps and current, which FluidNC does not notice. On
+        CoreXY that makes the machine move diagonally.
+        """
+        self.logger.info("Re-initializing stepper drivers ($MI)")
+        return self.send_gcode("$MI", wait_ok=True, timeout=10.0)
+
     def stop_motion(self, timeout: float = 5.0) -> bool:
         """
         Stop all motion WITHOUT losing position and discard queued commands.

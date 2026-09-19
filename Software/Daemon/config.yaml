@@ -15,7 +15,7 @@ machine:
   home_position: {X: 0.0, Y: 0.0, Z: 60.0}
   # X position where Y is re-homed during programs (rehome_y). Must be free of
   # obstacles along Y down to the Y switch - the full homing uses X=0.
-  rehome_safe_x: 0.0
+  rehome_safe_x: 600.0
   # Note: Safe Z height is dynamically read from machine_limits['Z'][1]
 
 # Override FluidNC axis limits at every daemon start (sent via $ commands).

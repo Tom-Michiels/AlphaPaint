@@ -573,6 +573,10 @@ class StateMachine:
 
         self.logger.info(f"Starting external program '{name}': {command}")
 
+        # Make sure the stepper drivers really hold their configuration: an
+        # emergency stop cuts their power and they come back with defaults.
+        self.fluidnc.init_motors()
+
         # Calculate canvas origin and size from points B and C
         min_x = min(self.point_B[0], self.point_C[0])
         min_y = min(self.point_B[1], self.point_C[1])

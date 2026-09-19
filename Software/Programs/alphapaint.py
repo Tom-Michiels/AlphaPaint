@@ -19,10 +19,13 @@ TOOLCHANGER_PEN_SPACING = 34
 TOOLCHANGER_Z_MAX = 60
 TOOLCHANGER_Y_SAFE = 55 
 
-# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Staat uit: homen
-# beweegt Y naar 0 en het is niet geverifieerd dat dat vrij is van de
-# penhouder. Zet op 1 zodra dat wel zeker is.
-REHOME_Y_EVERY_N_PEN_CHANGES = 0
+# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Het homen gebeurt op
+# machine.rehome_safe_x uit de daemon-config, links van alle pennen.
+REHOME_Y_EVERY_N_PEN_CHANGES = 1
+
+# Snelheid waarmee de kop het pen-slot in en uit beweegt. Laag houden: bij
+# een botsing tegen de houder is de schade dan beperkt.
+TOOLCHANGER_APPROACH_FEEDRATE = 1000
 
 # Maximale afwijking (mm) tussen de gevraagde en de werkelijke positie
 # voordat de kop de penhouder in beweegt.
@@ -209,7 +212,7 @@ class AlphaPaint:
         # Pas insteken als de kop echt voor het juiste slot staat
         self._verify_position(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=pen_z)
         # Langzaam Y naar pen (magneet klikt)
-        self.draw_to_machine(y=pen_y, feedrate=4000)
+        self.draw_to_machine(y=pen_y, feedrate=TOOLCHANGER_APPROACH_FEEDRATE)
         # Z omhoog
         self.move_to_machine(z=TOOLCHANGER_Z_MAX)
         # Y terug
@@ -224,11 +227,11 @@ class AlphaPaint:
         # Pas insteken als de kop echt voor het juiste slot staat
         self._verify_position(x=pen_x, y=pen_y + TOOLCHANGER_Y_SAFE, z=TOOLCHANGER_Z_MAX)
         # Langzaam Y naar pen positie (voorkomt stappenverlies)
-        self.draw_to_machine(y=pen_y, feedrate=4000)
+        self.draw_to_machine(y=pen_y, feedrate=TOOLCHANGER_APPROACH_FEEDRATE)
         # Langzaam Z naar pen hoogte
-        self.draw_to_machine(z=pen_z, feedrate=4000)
+        self.draw_to_machine(z=pen_z, feedrate=TOOLCHANGER_APPROACH_FEEDRATE)
         # Langzaam Z naar 0 (loslaten)
-        self.draw_to_machine(z=0, feedrate=4000)
+        self.draw_to_machine(z=0, feedrate=TOOLCHANGER_APPROACH_FEEDRATE)
         # Y terug
         self.move_to_machine(y=pen_y + TOOLCHANGER_Y_SAFE)
         # Z omhoog naar pen-hoogte
