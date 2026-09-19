@@ -61,7 +61,9 @@ def draw_curve(canvas, x0, y0, theta, L, delta, color, thickness):
     """
     stroke_layer = np.full(canvas.shape, 255, dtype=np.uint8)
     arc_info = None
-    if abs(delta) < 1e-6:
+    # Nearly straight segments are drawn as lines: their arc radius
+    # (L/|delta|) would be enormous while the bulge is below 0.1 pixel.
+    if abs(delta) < 0.02:
         x1 = x0 + L * math.cos(theta)
         y1 = y0 + L * math.sin(theta)
         pt0 = (int(round(x0)), int(round(y0)))

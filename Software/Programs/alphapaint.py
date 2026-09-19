@@ -19,6 +19,10 @@ TOOLCHANGER_PEN_SPACING = 34
 TOOLCHANGER_Z_MAX = 60
 TOOLCHANGER_Y_SAFE = 55 
 
+# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Wist een eventuele
+# Y-verschuiving voordat ze kan oplopen tot een botsing aan de onderkant.
+REHOME_Y_EVERY_N_PEN_CHANGES = 1
+
 
 class AlphaPaintError(Exception):
     """Exception raised when the AlphaPaint API returns an error."""
@@ -70,6 +74,7 @@ class AlphaPaint:
         self._request_id = 0
         self._canvas: Optional[Canvas] = None
         self._pen_is_down = False
+        self._pen_changes = 0
 
     def __enter__(self):
         return self
@@ -159,8 +164,18 @@ class AlphaPaint:
         x = TOOLCHANGER_FIRST_PEN_X + pen_index * TOOLCHANGER_PEN_SPACING
         return (x, TOOLCHANGER_PEN_Y, TOOLCHANGER_PEN_Z)
 
+    def rehome_y(self) -> None:
+        """Home the Y axis again (pen up, at the homing X position)."""
+        self._call("rehome_y")
+        self._pen_is_down = False
+
     def pickup_pen(self, pen_index: int) -> None:
         """Pick up pen from toolchanger slot (0-indexed)."""
+        if REHOME_Y_EVERY_N_PEN_CHANGES and self._pen_changes % REHOME_Y_EVERY_N_PEN_CHANGES == 0:
+            # Before approaching the pen holder near Y=0: the Y reference is
+            # fresh exactly when the gantry comes close to the Y end.
+            self.rehome_y()
+        self._pen_changes += 1
         pen_x, pen_y, pen_z = self._get_pen_position(pen_index)
 
         # Eerst Y naar veilige hoogte (voorkomt schuine aanrijding)
