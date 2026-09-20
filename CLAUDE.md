@@ -139,20 +139,30 @@ X axis upside down in the first version of this note.
 
 ### The pens, measured 2026-09-20 (`Programs/pen_survey.py`)
 
-| slot | ink | contact Z | thin line | fat line |
-|---|---|---|---|---|
-| 0 | dark blue-teal, rgb(15,64,112) | below 2.5 | 1.0 mm at Z 2.2 (pale) | 1.8 mm at Z 0.6 |
-| 1 | purple, rgb(73,58,111) | below 2.2 | 0.27 mm at Z 0.4 | 0.68 mm at Z 1.6 |
-| 2, 3, 4 | **nothing** - empty slots or dried-out pens | - | - | - |
+After Tom put new pens in the changer:
 
-Pen 0 is a broad marker: it lays about **1.7 mm**, not the half millimetre a
-drawing program tends to assume. Planning a scribble drawing at a finer line
-than the pen really is fills every dark area into a solid blob - that is what
-happened to the first magpie. Match the planning pixel to the measured width.
+| slot | ink | line width | notes |
+|---|---|---|---|
+| 0 | dark blue, rgb(4,42,93) | **2.2 mm** | marks from Z 2.2 down; the workhorse |
+| 1 | **nothing** at any height | - | empty slot or a dead pen |
+| 2 | magenta, rgb(109,30,82) | 0.7 - 1.2 mm | the only fine pen; best colour at Z 1.0-1.4 |
+| 3 | **nothing** at any height | - | empty slot or a dead pen |
+| 4 | orange | ~1.5 mm | marks, colour only guessed from a faint stroke |
 
-Below Z 0.2 pen 0 draws wider but **paler** (rgb 47,86,116 instead of 15,64,112):
-pressing harder splays the tip and starves the ink. Z 0.6 to 1.2 is its best
-range. Pen 1 stops marking altogether below Z 0.4.
+Pen 0 is a broad marker. Planning a scribble drawing at a finer line than the
+pen really is fills every dark area into a solid blob - that is what happened
+to the first magpie. Match the planning pixel to the measured width.
+
+**The bed is not flat.** On the pen-changer sheet, pen 0 marks from Z 2.2 at
+Y 110-194 but only from Z 0.9 at Y 215-275: about 1.5-2 mm of height
+difference over ten centimetres. A pen height measured in one place does not
+transfer to another. On the drawing sheet Z 0.5 works everywhere.
+
+**The camera drops off the USB bus** mid-run, repeatedly: the kernel
+re-enumerates it and `/dev/video0` reappears, but every capture then fails
+with `ioctl(VIDIOC_DQBUF): No such device`. Unplugging and replugging it is
+what brings it back. `pen_survey.py` treats a failed photo as a warning so the
+strokes are not lost; re-measure with `--measure-only`.
 
 Auto exposure blows a white sheet out completely (mean grey 255); the
 `camera.controls` in `config.yaml` fix the exposure and white balance and are
