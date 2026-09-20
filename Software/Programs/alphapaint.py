@@ -19,9 +19,12 @@ TOOLCHANGER_PEN_SPACING = 34
 TOOLCHANGER_Z_MAX = 60
 TOOLCHANGER_Y_SAFE = 55 
 
-# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Het homen gebeurt op
+# Y opnieuw homen bij elke N-de penwissel (0 = nooit). Staat uit: bij 1,2 A
+# bleef de machine in een half uur onafgebroken rijden binnen een kwart
+# millimeter, dus tussentijds homen is niet nodig en kost alleen tijd.
+# Zet op 1 als er ooit toch drift opduikt; het homen gebeurt dan op
 # machine.rehome_safe_x uit de daemon-config, links van alle pennen.
-REHOME_Y_EVERY_N_PEN_CHANGES = 1
+REHOME_Y_EVERY_N_PEN_CHANGES = 0
 
 # Snelheid waarmee de kop het pen-slot in en uit beweegt. Laag houden: bij
 # een botsing tegen de houder is de schade dan beperkt.
