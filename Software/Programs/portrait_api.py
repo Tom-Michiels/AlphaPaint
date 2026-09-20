@@ -246,14 +246,18 @@ def command_draw(args):
             z = args.pen_z if args.pen_z is not None else layer.get('z')
             print(f"pen {layer['pen']} at Z={z}, {len(strokes)} strokes")
             p.pickup_pen(layer['pen'])
-            if z is not None:
-                p.set_pen_z(float(z))
+            down = float(z) if z is not None else 0.5
             for number, stroke in enumerate(strokes):
                 p.move(x=stroke[0][0], y=stroke[0][1], wait=False)
-                p.pen_down()
+                # Lower and lift without waiting for the machine to get there.
+                # G-code runs in order, so the pen is down before the stroke
+                # starts either way; waiting only makes the machine stand still
+                # with the pen on the paper, which leaves a blob of ink at both
+                # ends of every stroke.
+                p.move(z=down, draw=True, wait=False)
                 for x, y in stroke[1:]:
                     p.move(x=x, y=y, draw=True, feed=args.feed, wait=False)
-                p.move(z=args.hop, draw=True)
+                p.move(z=args.hop, draw=True, wait=False)
                 if (number + 1) % 50 == 0:
                     print(f"    {number + 1}/{len(strokes)}, "
                           f"{(time.time() - started) / 60:.1f} min")
