@@ -137,6 +137,23 @@ the shift that comes out of `cv2.phaseCorrelate` is the scene moving, which is
 the opposite of the camera moving, and reading it the wrong way round put the
 X axis upside down in the first version of this note.
 
+### The pens, measured 2026-09-20 (`Programs/pen_survey.py`)
+
+| slot | ink | contact Z | thin line | fat line |
+|---|---|---|---|---|
+| 0 | dark blue-teal, rgb(15,64,112) | below 2.5 | 1.0 mm at Z 2.2 (pale) | 1.8 mm at Z 0.6 |
+| 1 | purple, rgb(73,58,111) | below 2.2 | 0.27 mm at Z 0.4 | 0.68 mm at Z 1.6 |
+| 2, 3, 4 | **nothing** - empty slots or dried-out pens | - | - | - |
+
+Pen 0 is a broad marker: it lays about **1.7 mm**, not the half millimetre a
+drawing program tends to assume. Planning a scribble drawing at a finer line
+than the pen really is fills every dark area into a solid blob - that is what
+happened to the first magpie. Match the planning pixel to the measured width.
+
+Below Z 0.2 pen 0 draws wider but **paler** (rgb 47,86,116 instead of 15,64,112):
+pressing harder splays the tip and starves the ink. Z 0.6 to 1.2 is its best
+range. Pen 1 stops marking altogether below Z 0.4.
+
 Auto exposure blows a white sheet out completely (mean grey 255); the
 `camera.controls` in `config.yaml` fix the exposure and white balance and are
 applied before every shot.
