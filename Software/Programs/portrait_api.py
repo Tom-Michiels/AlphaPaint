@@ -132,6 +132,17 @@ def plan_pen(canvas, target, ink, scribbles, thickness, strength, label):
     return strokes
 
 
+def parse_pen(spec):
+    """'0:4,42,93:2.2:0.5' -> pen, ink colour, line width in mm, pen-down Z."""
+    parts = spec.split(':')
+    if len(parts) < 3:
+        raise SystemExit(f"pen spec needs pen:r,g,b:width_mm[:z], got {spec!r}")
+    pen = int(parts[0])
+    r, g, b = (int(v) for v in parts[1].split(','))
+    return {'pen': pen, 'rgb': [r, g, b], 'width_mm': float(parts[2]),
+            'z': float(parts[3]) if len(parts) > 3 else None}
+
+
 def command_plan(args):
     import cv2
     import numpy as np
@@ -142,38 +153,50 @@ def command_plan(args):
     source = cv2.imread(args.image)
     if source is None:
         raise SystemExit(f"cannot read {args.image}")
-    height, width = source.shape[:2]
-    if width >= height:
-        size = (args.max_dim, max(1, int(args.max_dim * height / width)))
-    else:
-        size = (max(1, int(args.max_dim * width / height)), args.max_dim)
-    target = cv2.resize(source, size, interpolation=cv2.INTER_AREA).astype(np.float32)
-    if args.lighten:
-        target = target * (1 - args.lighten) + 255 * args.lighten
-    if args.contrast != 1.0:
-        target = np.clip((target - 128) * args.contrast + 128, 0, 255)
-
-    survey = load_pens(args.survey)
-    pens = [int(v) for v in args.pens.split(',')]
-    canvas = np.full(target.shape, 255.0, np.float32)
-
-    layers = []
-    for pen in pens:
-        entry = survey.get(pen)
-        if entry is None or not entry.get('rgb'):
-            raise SystemExit(f"pen {pen} has no measured colour; run pen_survey.py first")
-        r, g, b = entry['rgb']
-        ink = np.array([b, g, r], np.float32)
-        print(f"pen {pen}: {entry['colour']} rgb{tuple(entry['rgb'])}", file=sys.stderr)
-        strokes = plan_pen(canvas, target, ink, args.scribbles, args.thickness,
-                           args.strength, f"pen {pen}")
-        layers.append({'pen': pen, 'rgb': entry['rgb'], 'colour': entry['colour'],
-                       'z': entry.get('fat_z' if args.fat else 'thin_z'),
-                       'strokes': strokes})
 
     area = tuple(float(v) for v in args.area.split(','))
     area = (area[0] + args.margin, area[1] + args.margin,
             area[2] - args.margin, area[3] - args.margin)
+    area_w, area_h = area[2] - area[0], area[3] - area[1]
+
+    # Work in real millimetres: the planning pixel is a fixed fraction of a
+    # millimetre, so a pen's measured width becomes a thickness in pixels and
+    # the preview shows what the pen can actually do.
+    height, width = source.shape[:2]
+    scale = min(area_w / width, area_h / height)
+    pixels = (max(1, int(width * scale / args.mm_per_px)),
+              max(1, int(height * scale / args.mm_per_px)))
+    print(f"drawing {width * scale:.0f} x {height * scale:.0f} mm, planning at "
+          f"{args.mm_per_px} mm per pixel ({pixels[0]} x {pixels[1]})", file=sys.stderr)
+
+    target = cv2.resize(source, pixels, interpolation=cv2.INTER_AREA).astype(np.float32)
+    if args.contrast != 1.0:
+        target = np.clip((target - 128) * args.contrast + 128, 0, 255)
+    if args.white_point < 255:
+        # Anything lighter than the white point is paper: no pen goes there.
+        # Without this the greedy scribbles over every mid-tone, and a face
+        # turns into a filled blob instead of a drawing.
+        target = np.clip(target / args.white_point, 0, 1) * 255
+    if args.lighten:
+        target = target * (1 - args.lighten) + 255 * args.lighten
+
+    budgets = [int(v) for v in str(args.scribbles).split(',')]
+    canvas = np.full(target.shape, 255.0, np.float32)
+    layers = []
+    for index, spec in enumerate(args.pen):
+        entry = parse_pen(spec)
+        thickness = max(1, int(round(entry['width_mm'] / args.mm_per_px)))
+        r, g, b = entry['rgb']
+        ink = np.array([b, g, r], np.float32)
+        print(f"pen {entry['pen']}: rgb{tuple(entry['rgb'])}, {entry['width_mm']} mm "
+              f"= {thickness} px", file=sys.stderr)
+        budget = budgets[min(index, len(budgets) - 1)]
+        strokes = plan_pen(canvas, target, ink, budget, thickness,
+                           args.strength, f"pen {entry['pen']}")
+        entry['thickness_px'] = thickness
+        entry['strokes'] = strokes
+        layers.append(entry)
+
     shape = target.shape[:2]
     for layer in layers:
         layer['strokes_mm'] = [[list(p) for p in stroke]
@@ -187,11 +210,14 @@ def command_plan(args):
     plan_file = os.path.expanduser(args.out) + '.json'
     with open(plan_file, 'w') as f:
         json.dump({'created': time.time(), 'image': args.image, 'area': list(area),
+                   'mm_per_px': args.mm_per_px,
                    'pixel_size': [shape[1], shape[0]], 'layers': layers}, f)
-    total = sum(path_length([[tuple(p) for p in s] for s in layer['strokes_mm']])
-                for layer in layers)
+    total = 0.0
     for layer in layers:
-        print(f"pen {layer['pen']} ({layer['colour']}): {len(layer['strokes_mm'])} strokes")
+        length = path_length([[tuple(p) for p in s] for s in layer['strokes_mm']])
+        total += length
+        print(f"pen {layer['pen']} rgb{tuple(layer['rgb'])}: "
+              f"{len(layer['strokes_mm'])} strokes, {length / 1000:.1f} m")
     print(f"{total / 1000:.1f} m of line in total")
     print(f"preview: {preview}")
     print(f"plan:    {plan_file}")
@@ -204,7 +230,7 @@ def command_draw(args):
     layers = data['layers']
     for layer in layers:
         strokes = [[tuple(p) for p in s] for s in layer['strokes_mm']]
-        print(f"pen {layer['pen']} ({layer['colour']}): {len(strokes)} strokes, "
+        print(f"pen {layer['pen']}: {len(strokes)} strokes, "
               f"{path_length(strokes) / 1000:.1f} m")
     if args.dry_run:
         return 0
@@ -218,7 +244,7 @@ def command_draw(args):
                 continue
             strokes = [[tuple(p) for p in s] for s in layer['strokes_mm']]
             z = args.pen_z if args.pen_z is not None else layer.get('z')
-            print(f"pen {layer['pen']} ({layer['colour']}) at Z={z}, {len(strokes)} strokes")
+            print(f"pen {layer['pen']} at Z={z}, {len(strokes)} strokes")
             p.pickup_pen(layer['pen'])
             if z is not None:
                 p.set_pen_z(float(z))
@@ -244,11 +270,13 @@ def main():
 
     p_plan = sub.add_parser('plan')
     p_plan.add_argument('image')
-    p_plan.add_argument('--pens', default='2,1,0', help='draw order, light pen first')
-    p_plan.add_argument('--survey', default=None)
-    p_plan.add_argument('--scribbles', type=int, default=400, help='per pen')
-    p_plan.add_argument('--max-dim', type=int, default=600)
-    p_plan.add_argument('--thickness', type=int, default=1)
+    p_plan.add_argument('--pen', action='append', required=True,
+                        help='pen:r,g,b:width_mm[:z], repeat in draw order, light first')
+    p_plan.add_argument('--mm-per-px', type=float, default=0.5)
+    p_plan.add_argument('--scribbles', default='400',
+                        help='attempts per pen, one number or one per pen')
+    p_plan.add_argument('--white-point', type=float, default=255.0,
+                        help='tones lighter than this stay bare paper')
     p_plan.add_argument('--strength', type=float, default=0.85,
                         help='how much ink one pass lays down, 0..1')
     p_plan.add_argument('--lighten', type=float, default=0.10)
@@ -256,7 +284,6 @@ def main():
     p_plan.add_argument('--seed', type=int, default=3)
     p_plan.add_argument('--margin', type=float, default=12.0)
     p_plan.add_argument('--area', default='421,414,779,648')
-    p_plan.add_argument('--fat', action='store_true', help='use each pen\'s fat-line Z')
     p_plan.add_argument('--out', default=os.path.join(DATA, 'portrait'))
     p_plan.set_defaults(func=command_plan)
 
