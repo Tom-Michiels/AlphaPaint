@@ -98,6 +98,8 @@ def main():
     parser.add_argument('--length', type=float, default=18.0)
     parser.add_argument('--feed', type=int, default=2000)
     parser.add_argument('--measure-only', action='store_true')
+    parser.add_argument('--photos', default=None,
+                        help='where the column photos are (default: /var/log/alphapaint-photos)')
     args = parser.parse_args()
 
     pens = [int(v) for v in args.pens.split(',')]
@@ -111,7 +113,8 @@ def main():
                     'spacing': args.spacing, 'cam_y': cam_y}
                    for rung, z in enumerate(heights)]
         plan.append({'pen': pen, 'x': x, 'cam_x': x + args.length / 2, 'cam_y': cam_y,
-                     'photo': os.path.join('/var/log/alphapaint-photos', f'survey-pen{pen}.jpg'),
+                     'photo': os.path.join(args.photos or '/var/log/alphapaint-photos',
+                                           f'survey-pen{pen}.jpg'),
                      'strokes': strokes})
 
     if not args.measure_only:
@@ -131,7 +134,13 @@ def main():
                 p.return_pen(column['pen'])
                 p.move(x=column['cam_x'] - CAM_OFF_X, y=column['cam_y'] - CAM_OFF_Y, z=60.0)
                 time.sleep(0.8)
-                p.photo(f"survey-pen{column['pen']}")
+                try:
+                    p.photo(f"survey-pen{column['pen']}")
+                except PlotterError as e:
+                    # The strokes are on the paper either way; losing the camera
+                    # must not cost the whole run. Re-measure with --measure-only.
+                    print(f"  no photo of this column ({e}); the strokes are drawn",
+                          file=sys.stderr)
 
     print(f"\n{'pen':>3} {'Z':>5} {'width':>8} {'drawn':>7}  colour")
     survey = []
