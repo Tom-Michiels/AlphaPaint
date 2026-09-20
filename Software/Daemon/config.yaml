@@ -73,6 +73,13 @@ toolchanger:
 camera:
   device: auto
   photo_dir: /var/log/alphapaint-photos
+  # Auto exposure turns a white sheet into a blank white picture, so pen
+  # lines disappear. Fixed exposure keeps the paper around grey 185.
+  controls:
+    auto_exposure: 1              # 1 = manual
+    exposure_time_absolute: 250
+    white_balance_automatic: 0
+    white_balance_temperature: 4600
 
 # External drawing programs configuration
 # These programs are triggered by buttons E, F, G when enabled.

@@ -52,6 +52,9 @@ class MachineController:
         self.camera_device = camera.get('device', 'auto')
         self.photo_dir = camera.get('photo_dir', '/var/log/alphapaint-photos')
         self.camera_warmup_frames = int(camera.get('warmup_frames', 4))
+        # v4l2 controls applied before every shot. Auto exposure blows out a
+        # white sheet completely (mean grey 255), which hides pen lines.
+        self.camera_controls = camera.get('controls') or {}
 
     # ---------------------------------------------------------------- status
 
@@ -238,6 +241,17 @@ class MachineController:
                 break
         return device
 
+    def _apply_camera_controls(self, device: str):
+        """Fix exposure and friends; auto exposure ruins pictures of paper."""
+        if not self.camera_controls:
+            return
+        settings = ','.join(f"{key}={value}" for key, value in self.camera_controls.items())
+        try:
+            subprocess.run(['v4l2-ctl', '-d', device, '-c', settings],
+                           capture_output=True, text=True, timeout=5)
+        except Exception as e:
+            self.logger.debug(f"Could not set camera controls: {e}")
+
     def photo(self, name: Optional[str] = None) -> Dict:
         """Take a picture with the gantry camera and return its path.
 
@@ -247,6 +261,7 @@ class MachineController:
         device = self.find_camera()
         if not device:
             raise MachineError("no USB camera found (is it plugged in?)")
+        self._apply_camera_controls(device)
         os.makedirs(self.photo_dir, exist_ok=True)
         name = name or time.strftime('photo-%Y%m%d-%H%M%S')
         path = os.path.join(self.photo_dir, f"{name}.jpg")

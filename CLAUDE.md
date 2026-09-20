@@ -121,6 +121,21 @@ executed it, and the pen changer verifies the position before entering a slot.
 Photos go through `ffmpeg` so the daemon needs no image libraries; the camera
 is found automatically among the USB video devices.
 
+### Gantry camera, measured 2026-09-20
+
+The camera is mounted **rotated 90 degrees**: machine +X runs along image -y,
+machine +Y along image +x. Scale 12.7 px/mm across X and 12.4 px/mm across Y
+(about 0.079 mm per pixel), so one 1280x720 frame covers roughly 103 x 57 mm.
+
+It looks **41.4 mm in +Y** ahead of the pen tip (X offset -0.2 mm, i.e. none):
+to photograph the point (X, Y), put the gantry at (X + 0.2, Y - 41.4). Measured
+by drawing a 20 mm cross and centring it in the frame; the check shot landed
+within 0.3 mm. Values live in `~/alphapaint-exploration/camera-calibration.json`.
+
+Auto exposure blows a white sheet out completely (mean grey 255); the
+`camera.controls` in `config.yaml` fix the exposure and white balance and are
+applied before every shot.
+
 Security: the API binds to localhost. Opening it to the network lets anything
 on that network move the machine, so set `remote_api.token` as well.
 
