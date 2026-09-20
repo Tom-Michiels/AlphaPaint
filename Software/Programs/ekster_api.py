@@ -204,7 +204,7 @@ def order_strokes(strokes):
     return ordered
 
 
-def draw(plan_path, pen, feed, pen_z, start_at, dry_run):
+def draw(plan_path, pen, feed, pen_z, start_at, dry_run, hop=6.0):
     with open(plan_path) as f:
         data = json.load(f)
     strokes = [[tuple(point) for point in stroke] for stroke in data['strokes_mm']]
@@ -233,13 +233,17 @@ def draw(plan_path, pen, feed, pen_z, start_at, dry_run):
             p.pen_down()
             for x, y in stroke[1:]:
                 p.move(x=x, y=y, draw=True, feed=feed, wait=False)
-            p.pen_up()
+            # A low hop instead of a full pen up: Z runs at 2400 mm/min, so
+            # going to 60 and back costs three seconds on every stroke - more
+            # than the stroke itself takes to draw.
+            p.move(z=hop, draw=True)
             if (index + 1) % 20 == 0:
                 elapsed = time.time() - started
                 per = elapsed / (index + 1 - start_at)
                 print(f"  stroke {index + 1}/{len(strokes)}, {elapsed / 60:.1f} min, "
                       f"{per * (len(strokes) - index - 1) / 60:.1f} min to go")
 
+        p.pen_up()
         print("putting the pen back")
         p.return_pen(pen)
         print(f"done in {(time.time() - started) / 60:.1f} min")
@@ -274,11 +278,14 @@ def main():
     p_draw.add_argument('--pen-z', type=float, default=None)
     p_draw.add_argument('--start-at', type=int, default=0,
                         help='resume at this stroke (the pen is assumed to be held)')
+    p_draw.add_argument('--hop', type=float, default=6.0,
+                        help='mm the pen lifts between strokes')
     p_draw.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
     if args.command == 'draw':
-        return draw(args.plan, args.pen, args.feed, args.pen_z, args.start_at, args.dry_run)
+        return draw(args.plan, args.pen, args.feed, args.pen_z, args.start_at,
+                    args.dry_run, args.hop)
 
     import cv2
     import numpy as np
