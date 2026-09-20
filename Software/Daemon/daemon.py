@@ -16,7 +16,7 @@ import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
-from lib import ConsoleHandler, FluidNCHandler, StateMachine
+from lib import ConsoleHandler, FluidNCHandler, StateMachine, RemoteAPI
 
 
 class AlphaPaintDaemon:
@@ -43,6 +43,7 @@ class AlphaPaintDaemon:
         self.console: Optional[ConsoleHandler] = None
         self.fluidnc: Optional[FluidNCHandler] = None
         self.state_machine: Optional[StateMachine] = None
+        self.remote_api: Optional[RemoteAPI] = None
         self.running = False
         self.logger = logging.getLogger(__name__)
 
@@ -273,6 +274,12 @@ class AlphaPaintDaemon:
 
     def _cleanup_connections(self):
         """Clean up all connections."""
+        if self.remote_api:
+            try:
+                self.remote_api.stop()
+            except Exception as e:
+                self.logger.debug(f"Error stopping remote API: {e}")
+            self.remote_api = None
         if self.state_machine:
             try:
                 self.state_machine.stop()
@@ -415,6 +422,10 @@ class AlphaPaintDaemon:
 
                 # Start state machine
                 self.state_machine.start()
+
+                # HTTP API for software that drives the machine itself
+                self.remote_api = RemoteAPI(self.state_machine, self.config)
+                self.remote_api.start()
 
                 self.logger.info("Daemon running - devices connected")
 

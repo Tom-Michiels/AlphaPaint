@@ -21,10 +21,11 @@ class StateMachine:
     STATE_READY = "READY"
     STATE_DRAWING = "DRAWING"
     STATE_EXTERNAL_PROGRAM = "EXTERNAL_PROGRAM"
+    STATE_REMOTE = "REMOTE"
     STATE_ERROR = "ERROR"
 
     # States in which the machine position is trusted (homed and verified)
-    HOMED_STATES = ("CANVAS_SETUP", "READY", "DRAWING", "EXTERNAL_PROGRAM")
+    HOMED_STATES = ("CANVAS_SETUP", "READY", "DRAWING", "EXTERNAL_PROGRAM", "REMOTE")
 
     DEFAULT_LIMITS = {'X': (0.0, 300.0), 'Y': (-150.0, 150.0), 'Z': (0.0, 50.0)}
     # Maximum deviation (mm) between reported MPos and the configured home
@@ -85,6 +86,9 @@ class StateMachine:
         self.console_mode = "PASSIVE"
         self.active_axis = "X"
         self.precision_mode = False
+
+        # Set while software asked for a homing cycle and wants control back
+        self._resume_remote_after_homing = False
 
         # External program handler
         self.external_handler: Optional[ExternalProgramHandler] = None
@@ -265,6 +269,17 @@ class StateMachine:
         """
         self.logger.info(f"Button {button} {action} in state {self.state}")
         with self._lock:
+            if self.state == self.STATE_REMOTE:
+                # Software is in control; the console only shows the position.
+                abort_allowed = (self.config.get('remote_api', {}) or {}).get(
+                    'abort_button', True)
+                if button == 'A' and action == 'LONG' and abort_allowed:
+                    self.logger.warning("Remote control aborted with the console button")
+                    self.leave_remote_control()
+                    self._on_button_locked(button, action)
+                else:
+                    self.logger.info("Button ignored: software is in control")
+                return
             self._on_button_locked(button, action)
 
     def _on_button_locked(self, button: str, action: str):
@@ -345,6 +360,46 @@ class StateMachine:
         # Execute homing in background thread to avoid blocking
         threading.Thread(target=self._execute_homing, daemon=True).start()
 
+    def enter_remote_control(self):
+        """Hand control to external software.
+
+        The console goes to PASSIVE, so its displays keep following the
+        machine position while its buttons no longer do anything.
+        """
+        with self._lock:
+            if self.state == self.STATE_HOMING:
+                raise RuntimeError("cannot take over while homing")
+            if self.external_handler:
+                raise RuntimeError("an external program is running")
+            self._set_console_mode('PASSIVE')
+            for led in ['B', 'C', 'D', 'E', 'F', 'G']:
+                self.console.set_led(led, 'OFF')
+            self.console.set_led('A', 'ON' if self.homed else 'BLINK')
+            self._transition_locked(self.STATE_REMOTE)
+
+    def leave_remote_control(self):
+        """Give control back to the console."""
+        with self._lock:
+            if self.state != self.STATE_REMOTE:
+                return
+            if self.homed and self.point_B and self.point_C:
+                self._transition_locked(self.STATE_READY)
+                self._set_console_mode('ACTIVE')
+            elif self.homed:
+                self._transition_locked(self.STATE_CANVAS_SETUP)
+                self._set_console_mode('ACTIVE')
+            else:
+                self._transition_locked(self.STATE_NOT_HOMED)
+
+    def request_homing(self):
+        """Start a homing cycle from software; returns immediately."""
+        with self._lock:
+            if self.state == self.STATE_HOMING:
+                return
+            # Set before starting: the homing thread may finish quickly
+            self._resume_remote_after_homing = self.state == self.STATE_REMOTE
+            self._start_homing_sequence()
+
     def _homing_failed(self, reason: str):
         self.logger.error(f"Homing failed: {reason}")
         self._log_motor_status()
@@ -411,8 +466,13 @@ class StateMachine:
 
                 self._position_lost_pending = False
                 self.homed = True
-                self._set_console_mode('ACTIVE')
-                self._transition_locked(self.STATE_CANVAS_SETUP)
+                if getattr(self, '_resume_remote_after_homing', False):
+                    self._resume_remote_after_homing = False
+                    self.console.set_led('A', 'ON')
+                    self._transition_locked(self.STATE_REMOTE)
+                else:
+                    self._set_console_mode('ACTIVE')
+                    self._transition_locked(self.STATE_CANVAS_SETUP)
 
             self.logger.info(f"Homing complete and verified at {pos}")
 

@@ -90,6 +90,40 @@ buffer). `ok` means "planned", **not** "executed" - use `G4 P0` to synchronize.
 variants, `set_feedrate`, `rehome_y`, `flush`, `done`. Programs are killed with
 an `interrupted` event; a rejected move raises in the program.
 
+## Remote control API (software instead of the console)
+
+`Daemon/lib/remote_api.py` serves a JSON API (default `http://127.0.0.1:8080`)
+that hands control to external software: the console then only shows the
+position on its displays, while its buttons do nothing (a long press on A stays
+as an abort unless `remote_api.abort_button` is false). This is the route for a
+program - or a language model wrapping these calls as tools - to drive the
+machine and the gantry camera.
+
+```
+GET  /api/status        POST /api/control {"mode":"remote"|"console"}
+POST /api/home          POST /api/stop      POST /api/sync
+POST /api/move {"x","y","z","feed","draw","wait"}     machine coordinates
+POST /api/pen {"action":"up"|"down","z"}   POST /api/pen/z {"z"}
+POST /api/pen/pickup {"index"}   POST /api/pen/return {"index"}
+POST /api/photo {"name"}         GET  /api/photo/last
+```
+
+`Programs/plotter_api.py` is a small client (standard library only, so it also
+runs under the system python3 which has OpenCV), and `Programs/explore.py` uses
+it for the calibration experiments: `scan` (diagonal sweep with photos),
+`paper` (find the sheet in those photos), `pen-depth` (a ladder of strokes at
+decreasing Z to see where a pen starts marking) and `camera` (draw a cross and
+look at it to get the camera-to-pen offset and mm per pixel).
+
+`MachineController` (`lib/machine_control.py`) is the layer underneath: limits
+checked, a rejected move raises, a move counts as done only once FluidNC really
+executed it, and the pen changer verifies the position before entering a slot.
+Photos go through `ffmpeg` so the daemon needs no image libraries; the camera
+is found automatically among the USB video devices.
+
+Security: the API binds to localhost. Opening it to the network lets anything
+on that network move the machine, so set `remote_api.token` as well.
+
 ## Operating
 
 ```bash

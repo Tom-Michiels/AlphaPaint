@@ -26,7 +26,7 @@ import time
 import serial
 
 CENTER_X = 100.0
-SWEEP_MIN = 30.0
+SWEEP_MIN = 10.0     # close to the Y switch: drift beyond ~12 mm trips it at once
 SWEEP_MAX = 180.0
 SAFE_Z = 60.0
 AXIS = 'Y'

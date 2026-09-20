@@ -46,6 +46,34 @@ debugging:
   # Analyze afterwards with tools/analyze_position_trace.py.
   position_trace_file: /var/log/alphapaint-position-trace.csv
 
+# HTTP API for software that takes over control completely (see
+# lib/remote_api.py). While it is in control the console only shows the
+# position; its buttons do nothing, except a long press on A as an abort.
+# Binding to anything other than 127.0.0.1 lets the whole network move the
+# machine, so set a token as well if you do.
+remote_api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8080
+  token: ""
+  abort_button: true
+
+# Pen changer geometry, used by the API's pickup/return (the client library
+# Programs/alphapaint.py has the same numbers for console-driven programs).
+toolchanger:
+  slots: 5
+  first_x: 700.0
+  spacing: 34.0
+  y: 12.0
+  z: 13.0
+  y_safe: 55.0
+  approach_feedrate: 1000
+
+# USB camera on the gantry. 'auto' picks the first USB video device.
+camera:
+  device: auto
+  photo_dir: /var/log/alphapaint-photos
+
 # External drawing programs configuration
 # These programs are triggered by buttons E, F, G when enabled.
 # Programs communicate via stdin/stdout JSON protocol.

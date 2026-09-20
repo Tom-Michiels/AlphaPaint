@@ -4,6 +4,7 @@ from .console import ConsoleHandler
 from .fluidnc import FluidNCHandler
 from .state_machine import StateMachine
 from .drawing import draw_line, draw_ellipse
+from .remote_api import RemoteAPI
 from .external_program import ExternalProgramHandler
 
 __all__ = [
